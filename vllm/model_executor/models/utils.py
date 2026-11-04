@@ -852,6 +852,75 @@ def spec_decode_needs_target_embed(vllm_config: VllmConfig) -> bool:
     return pp.world_size > 1 and pp.is_last_rank
 
 
+# ---------------------------------------------------------------------------
+# Lightweight disaggregation (LWD) module ownership.
+#
+# The edge and cloud roles of an LWD pair own disjoint parts of one model:
+# the edge un-embeds (embed_tokens + vision tower + lm_head) while the cloud
+# owns every transformer layer plus the final norm. Which modules a role
+# never builds is declared in a single table so three consumers stay in
+# agreement:
+#
+#   * the build-time guards in the model files (lwd_skips_module),
+#   * the load-time weight filter (model_loader/lwd_weight_filter.py),
+#   * the offline checkpoint splitter (scripts/lwd/split_lwd_checkpoint.py).
+#
+# Keys are dotted module paths as addressed inside a model, so a
+# WeightsMapper-style prefix (e.g. "language_model." in Qwen3-VL) is
+# tolerated. Values list the roles that build the module; any other role
+# holds it as a PPMissingLayer placeholder instead.
+# ---------------------------------------------------------------------------
+
+LwdRole = Literal["edge", "cloud"]
+
+_LWD_BOTH_ROLES: frozenset[LwdRole] = frozenset(("edge", "cloud"))
+
+LWD_MODULE_OWNERSHIP: dict[str, frozenset[LwdRole]] = {
+    # Un-embed bookends both roles need to sample or replay tokens.
+    "model.embed_tokens": _LWD_BOTH_ROLES,
+    "lm_head": _LWD_BOTH_ROLES,
+    # The transformer stack belongs to the cloud.
+    "model.layers": frozenset(("cloud",)),
+    "model.norm": frozenset(("cloud",)),
+    # The vision tower and whatever merges with it belong to the edge.
+    "visual": frozenset(("edge",)),
+    # Speculative-decoding drafter belongs to the cloud.
+    "model.mtp": frozenset(("cloud",)),
+}
+
+
+def lwd_role() -> str | None:
+    """The LWD role of this process, or None outside an LWD deployment.
+
+    Guards evaluate this once at construction time. A None result means a
+    plain (non-LWD) engine and every guard keeps its original path.
+    """
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    lwd_config = (
+        vllm_config.lwd_config
+        if vllm_config is not None and vllm_config.lwd_config is not None
+        else None
+    )
+    return lwd_config.role if lwd_config is not None else None
+
+
+def lwd_skips_module(module_path: str, role: str | None) -> bool:
+    """Whether *role* holds *module_path* as a PPMissingLayer placeholder.
+
+    Matching is suffix-based so guards can pass ``maybe_prefix(prefix, ..)``
+    paths unchanged. An unlisted module is never skipped, and a None role
+    (non-LWD deployment) skips nothing.
+    """
+    if role is None:
+        return False
+    for suffix, owners in LWD_MODULE_OWNERSHIP.items():
+        if module_path == suffix or module_path.endswith("." + suffix):
+            return role not in owners
+    return False
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,

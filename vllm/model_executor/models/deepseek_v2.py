@@ -124,6 +124,8 @@ from .utils import (
     get_pp_missing_layer_names,
     get_spec_layer_idx_from_weight_name,
     is_pp_missing_parameter,
+    lwd_role,
+    lwd_skips_module,
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
@@ -1478,7 +1480,11 @@ class DeepseekV2Model(nn.Module):
             "mlp",
         )
 
-        if get_pp_group().is_last_rank:
+        # LWD edge un-embeds hidden states the cloud has already normed, so
+        # it never builds the final norm; a None role keeps the stock path.
+        if get_pp_group().is_last_rank and not lwd_skips_module(
+            maybe_prefix(prefix, "norm"), lwd_role()
+        ):
             self.norm = RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
