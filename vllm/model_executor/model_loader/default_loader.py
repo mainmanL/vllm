@@ -4,7 +4,8 @@ import dataclasses
 import glob
 import os
 import time
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
+from functools import partial
 from typing import cast
 
 import torch
@@ -18,6 +19,10 @@ from vllm.model_executor.layers.quantization.torchao import torchao_version_at_l
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
     compute_local_expert_ids,
+)
+from vllm.model_executor.model_loader.lwd_weight_filter import (
+    lwd_should_skip_weight,
+    parse_skip_keys,
 )
 from vllm.model_executor.model_loader.weight_utils import (
     download_safetensors_index_file_from_hf,
@@ -242,7 +247,7 @@ class DefaultModelLoader(BaseModelLoader):
         return hf_folder, hf_weights_files, use_safetensors
 
     def _get_weights_iterator(
-        self, source: "Source"
+        self, source: "Source", skip_name: Callable[[str], bool] | None = None
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
@@ -289,6 +294,7 @@ class DefaultModelLoader(BaseModelLoader):
                         self.load_config.use_tqdm_on_load,
                         self.load_config.safetensors_load_strategy,
                         local_expert_ids=self.local_expert_ids,
+                        skip_name=skip_name,
                         safetensors_prefetch_num_threads=(
                             self.load_config.safetensors_prefetch_num_threads
                         ),
@@ -330,14 +336,33 @@ class DefaultModelLoader(BaseModelLoader):
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
             allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
         )
-        yield from self._get_weights_iterator(primary_weights)
+        # LWD: derive the pre-read skip filter from the same ownership table
+        # the build-time guards use, so a trimmed role pointed at a full
+        # checkpoint reads only its own slice of the shards. lwd_role is
+        # imported lazily because models.utils pulls in this package at
+        # module scope.
+        from vllm.model_executor.models.utils import lwd_role
+
+        role = lwd_role()
+        skip_name: Callable[[str], bool] | None = None
+        if role is not None:
+            skip_keys = parse_skip_keys(role)
+            if skip_keys:
+                skip_name = partial(lwd_should_skip_weight, role=role)
+                logger.info_once(
+                    "LWD weight filter: role '%s' drops tensors under %s "
+                    "before reading from disk",
+                    role,
+                    sorted(skip_keys),
+                )
+        yield from self._get_weights_iterator(primary_weights, skip_name)
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source],
             getattr(model, "secondary_weights", ()),
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(source)
+            yield from self._get_weights_iterator(source, skip_name)
 
     def download_model(self, model_config: ModelConfig) -> None:
         self._prepare_weights(
