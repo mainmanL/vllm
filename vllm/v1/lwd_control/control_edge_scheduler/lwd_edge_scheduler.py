@@ -495,6 +495,25 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         code = notify.finish_reasons[index]
         return None if code == LWD_NOT_FINISHED else FinishReason(code)
 
+    @staticmethod
+    def _lwd_grammar_ready(request: Request) -> bool:
+        """Whether a structured request's grammar is compiled; plain
+        requests are always ready.
+
+        The grammar is compiled asynchronously in the engine's input
+        thread pool, and the native waiting loop defers requests in
+        WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR until the future resolves
+        (_try_promote_blocked_waiting_request). The picker's selection
+        must stay reproducible by the native scheduler, so a candidate
+        whose grammar is still compiling must not be picked this step.
+        Read-only on purpose: the status promotion stays with the native
+        loop, not the picker.
+        """
+        if request.status != RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+            return True
+        structured_req = request.structured_output_request
+        return bool(structured_req and structured_req.grammar)
+
     def _lwd_pick_prefill_batch(
         self, dp_idx: int
     ) -> tuple[list[str], dict[str, int], int]:
@@ -522,6 +541,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             for r in [*self.skipped_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
+            and self._lwd_grammar_ready(r)
         ]
         req_ids, expected = lwd_pick_prefill_batch(
             running,
@@ -954,9 +974,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_validate_request(self, request: Request) -> None:
         """Mode boundary validation (edge capability surface): reject
-        client-provided prompt_embeds/pooling/structured output/sampling
-        params not carried on the wire; violations raise ValueError and are
-        rejected before enqueueing."""
+        client-provided prompt_embeds/pooling/sampling params not carried
+        on the wire; violations raise ValueError and are rejected before
+        enqueueing. Structured output is carried on the wire
+        (LwdRequestNotify.structured_outputs) and stays admitted."""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
@@ -967,11 +988,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if request.pooling_params is not None:
             raise ValueError(
                 "[LWD] prefill-only mode does not support pooling requests "
-                f"(request {request.request_id})"
-            )
-        if request.use_structured_output:
-            raise ValueError(
-                "[LWD] prefill-only mode does not support structured output "
                 f"(request {request.request_id})"
             )
         sp = request.sampling_params

@@ -17,6 +17,7 @@ publishing) unchanged.
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -26,7 +27,7 @@ from typing import Any
 import torch
 
 from vllm.lwd_logger import lwd_logger
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc, EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
@@ -67,6 +68,28 @@ _LWD_INGEST_JOIN_TIMEOUT_S = 5.0
 _LwdIngestItem = tuple[LwdPeer, LwdEdgeToCloudMessage]
 
 
+def _lwd_decode_structured_outputs(
+    payload: str,
+) -> StructuredOutputsParams | None:
+    """Rebuild the constraint carried by LwdRequestNotify.structured_outputs.
+
+    The edge frontend has already validated it, so the cloud only
+    deserializes. Private fields are init=False, so they cannot enter the
+    constructor: `_backend` is backfilled by hand (grammar_init reads it to
+    pick the backend; the cloud has no frontend to re-derive it), while
+    `_backend_was_auto` is a frontend bookkeeping bit and is dropped.
+    Empty payload = plain request.
+    """
+    if not payload:
+        return None
+    data = json.loads(payload)
+    backend = data.pop("_backend", None)
+    data.pop("_backend_was_auto", None)
+    params = StructuredOutputsParams(**data)
+    params._backend = backend
+    return params
+
+
 class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     """The LWD seams of a cloud engine, shared by both engine bases."""
 
@@ -82,6 +105,17 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             raise ValueError(
                 "[LWD] prefix caching with KV connector is unsupported: "
                 "external hits bypass the negotiated READY boundary"
+            )
+        if vllm_config.model_config.skip_tokenizer_init:
+            # Startup fail-fast: structured-output grammars are compiled and
+            # the sampling bitmask applied on the cloud, and
+            # StructuredOutputManager cannot do either without a tokenizer.
+            # Waiting for the first structured request to crash is worse
+            # than rejecting the launch here.
+            raise ValueError(
+                "[LWD] the cloud role requires the tokenizer "
+                "(structured-output grammar compilation); restart without "
+                "skip_tokenizer_init"
             )
         # Pre-recv hint MQ must exist before super().__init__ spawns the
         # executor workers (same process): create_hint_mq() publishes the
@@ -463,6 +497,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
         self._lwd_request_nonces[request_id] = notify.prefix_nonce
         request = self._lwd_build_request(notify)
+        if request.use_structured_output:
+            # Wire-rebuilt requests bypass preprocess_add_request (the only
+            # native grammar_init entry, engine/core.py), so compile
+            # explicitly; otherwise the request would sit in
+            # WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR forever.
+            self.structured_output_manager.grammar_init(request)
         self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
         lwd_logger.info(
             "[cloud] request added req=%s tokens=%d nonce=%d",
@@ -610,9 +650,22 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Rebuild sampling state carried by the request notify."""
         values = {f: getattr(req_notify, f) for f in LWD_SAMPLING_DEFAULTS}
         values["stop_token_ids"] = list(values["stop_token_ids"])
+        try:
+            structured_outputs = _lwd_decode_structured_outputs(
+                req_notify.structured_outputs
+            )
+        except Exception as e:
+            # Fail-fast with context: a malformed payload must never enqueue
+            # as a half-rebuilt request. This cannot happen for payloads the
+            # edge frontend packed (it validated the constraint first).
+            raise ValueError(
+                "[LWD] malformed structured_outputs payload for request "
+                f"{req_notify.request_id}: {req_notify.structured_outputs!r}"
+            ) from e
         sampling_params = SamplingParams(
             **values,
             skip_reading_prefix_cache=req_notify.skip_reading_prefix_cache,
+            structured_outputs=structured_outputs,
         )
         sampling_params.update_from_generation_config({}, req_notify.eos_token_id)
         LwdControlDiag.cloud_request_admitted(req_notify, sampling_params)

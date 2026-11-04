@@ -51,6 +51,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRefillNotify,
     LwdRequestNotify,
     lwd_decode_cloud_to_edge,
+    lwd_encode_structured_outputs,
 )
 from vllm.v1.request import Request
 
@@ -323,6 +324,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                 ),
                 eos_token_id=sampling_params.eos_token_id,
                 mrope_positions=self.scheduler.lwd_mrope_positions(request.request_id),
+                structured_outputs=lwd_encode_structured_outputs(
+                    sampling_params.structured_outputs
+                ),
                 **values,
             ),
         )

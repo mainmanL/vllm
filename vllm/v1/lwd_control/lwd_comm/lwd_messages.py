@@ -10,11 +10,21 @@ Fields may only be appended with defaults. Any other change bumps
 `LWD_MESSAGE_VERSION`, which the link handshake checks on both sides.
 """
 
-from typing import TypeAlias
+import dataclasses
+import json
+from typing import TYPE_CHECKING, TypeAlias
 
 import msgspec
 
-LWD_MESSAGE_VERSION = 3
+if TYPE_CHECKING:
+    from vllm.sampling_params import StructuredOutputsParams
+
+LWD_MESSAGE_VERSION = 4
+# 4: LwdRequestNotify gains structured_outputs (edge-validated constraint
+# JSON; the cloud compiles the grammar and applies the sampling bitmask).
+# The append is decode-compatible per the rule above, but the version still
+# bumps on purpose: a v3 cloud would silently drop the constraint instead
+# of enforcing it, so mixed versions must fail the link handshake.
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""
@@ -82,6 +92,10 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     mrope_positions: bytes = b""
     """Contiguous int64 [3, num_prompt_tokens] M-RoPE positions of the full
     prompt; empty when unused."""
+    structured_outputs: str = ""
+    """JSON-serialized StructuredOutputsParams, already validated by the
+    edge frontend. The cloud rebuilds the object, compiles the grammar and
+    applies the sampling bitmask; empty string = plain request."""
 
 
 LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
@@ -102,6 +116,25 @@ LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
 carries; the edge packs and the cloud rebuilds them from this one table.
 `eos_token_id` is not a `SamplingParams` argument and travels on its own."""
 LWD_SAMPLING_DEFAULTS = dict(LWD_SAMPLING_FIELDS)
+
+
+def lwd_encode_structured_outputs(
+    params: "StructuredOutputsParams | None",
+) -> str:
+    """Serialize StructuredOutputsParams for the wire.
+
+    The edge frontend has already validated the constraint, so the wire form
+    is the plain dataclass dict: it includes the private fields, because the
+    cloud has no frontend to re-derive them (grammar_init reads `_backend`
+    to pick the backend). None means a plain request and travels as "".
+
+    Kept in this module (not the engines) so encode and message schema
+    cannot drift apart; the counterpart decode lives in
+    lwd_cloud_engine.py, next to its only consumer.
+    """
+    if params is None:
+        return ""
+    return json.dumps(dataclasses.asdict(params))
 
 
 class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
