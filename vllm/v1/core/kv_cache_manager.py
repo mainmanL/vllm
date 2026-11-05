@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
@@ -27,6 +27,11 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
+
+if TYPE_CHECKING:
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+        LwdPrefixReservations,
+    )
 
 logger = init_logger(__name__)
 
@@ -159,6 +164,8 @@ class KVCacheManager:
 
         self.enable_caching = enable_caching
         self.lwd_prefix_caching = False
+        # Wired by LwdPrefixReservations (cloud-side LWD prefix cache).
+        self.lwd_prefix_reservations: LwdPrefixReservations | None = None
         self.enable_kv_cache_events = enable_kv_cache_events
         self.use_eagle = use_eagle
         self.log_stats = log_stats

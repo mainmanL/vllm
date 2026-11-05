@@ -26,7 +26,7 @@ import copy
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -50,6 +50,7 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_dp_account import (
 )
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_picker import (
     LwdPrefillCandidate,
+    lwd_grammar_ready,
     lwd_pick_prefill_batch,
 )
 from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
@@ -74,6 +75,11 @@ if TYPE_CHECKING:
 LwdSendToCloud = Callable[[int, LwdEdgeToCloudMessage], None]
 """Sends one message to the cloud DP rank of dp_idx; raises instead of
 losing it."""
+
+LwdMropePositionsFn = Callable[..., tuple[torch.Tensor, Any]]
+"""Model-family static method _get_mrope_input_positions (keyword-only,
+family-specific signature; returns the [3, N] positions grid and its
+token delta)."""
 
 # Cloud finish code -> edge terminal state (frontend reason goes through the
 # output channel; ERROR maps to ABORTED)
@@ -146,7 +152,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # _get_mrope_input_positions (cache the method itself rather than
         # the model class so the semantics stay direct; validated on first
         # use, unsupported families fail fast).
-        self._lwd_mrope_positions_fn = None
+        self._lwd_mrope_positions_fn: LwdMropePositionsFn | None = None
         # Chunk unit C = min(remaining, C): taken from the local
         # long_prefill_token_threshold (native truncation boundary,
         # naturally reproduced on both sides); when unset (<=0), falls back
@@ -408,7 +414,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         for index, request_id in enumerate(notify.req_ids):
             if prefix_nonces:
                 request = self.requests.get(request_id)
-                current_nonce = getattr(request, "lwd_prefix_nonce", 0)
+                current_nonce = request.lwd_prefix_nonce if request else 0
                 if request is None or prefix_nonces[index] != current_nonce:
                     lwd_logger.warning(
                         "[edge-deliver] drop stale generation req=%s nonce=%d "
@@ -460,6 +466,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 )
                 continue
             if finished_now:
+                # finished_now means _lwd_finish_code returned a real code.
+                assert finish_reason is not None
                 # The ground truth of the cloud's stop decision lands here:
                 # native finish settles the account (KV/cache release and
                 # the finished_req_ids handover all go through the native
@@ -522,6 +530,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             )
             for r in [*self.skipped_waiting, *self.waiting]
             if self._lwd_dp_of(r.request_id) == dp_idx
+            and lwd_grammar_ready(
+                r, RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+            )
         ]
         req_ids, expected = lwd_pick_prefill_batch(
             running,
@@ -573,7 +584,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def lwd_edge_request_active(self, request_id: str) -> bool:
         if request_id in self._lwd_route or request_id in self.requests:
             return True
-        announced = getattr(self, "_lwd_announced_refills", set())
+        announced: set[tuple[int, int]] = getattr(self, "_lwd_announced_refills", set())
         return any(
             (account.dp_idx, seqno) in announced and request_id in request_ids
             for account in self._lwd_accounts
@@ -628,7 +639,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return
         if not self._lwd_request_has_mm(request):
             return
-        if self._lwd_mrope_positions_fn is None:
+        fn = self._lwd_mrope_positions_fn
+        if fn is None:
             from vllm.model_executor.models import ModelRegistry
 
             model_cls, _ = ModelRegistry.resolve_model_cls(
@@ -645,11 +657,14 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     f"(request {request.request_id})"
                 )
             self._lwd_mrope_positions_fn = fn
+        # Edge embedding requests always carry real tokens (prompt_embeds
+        # is rejected at admission).
+        assert request.prompt_token_ids is not None
         mrope_features = [
             f for f in request.mm_features if f.modality != "prompt_embeds"
         ]
         _t_mrope = time.monotonic()
-        positions, _delta = self._lwd_mrope_positions_fn(
+        positions, _delta = fn(
             input_tokens=list(request.prompt_token_ids),
             mm_features=mrope_features,
             config=self.vllm_config.model_config.hf_config,
@@ -719,7 +734,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         dp_idx = self._lwd_dp_of_settling(request_id)
         if request is None or dp_idx is None:
             return []
-        prefix_nonce = getattr(request, "lwd_prefix_nonce", 0)
+        prefix_nonce = request.lwd_prefix_nonce
         if notify.prefix_nonce != prefix_nonce:
             lwd_logger.warning(
                 "[edge-refill] stale req=%s nonce=%d ignored: current=%d",
@@ -789,13 +804,15 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         batch = scheduler_output.lwd_batch
         assert batch is not None and batch.batch_meta is not None
         meta = batch.batch_meta
+        # Refill chunks always travel as EMBED batches.
+        assert isinstance(meta, LwdEmbedBatch)
         request_id = meta.req_ids[0]
         dp_idx = meta.dp_idx
         request = self.requests.get(request_id)
-        prefix_nonce = getattr(meta, "lwd_prefix_nonce", 0)
+        prefix_nonce = meta.lwd_prefix_nonce
         if (
             request is None
-            or getattr(request, "lwd_prefix_nonce", 0) != prefix_nonce
+            or request.lwd_prefix_nonce != prefix_nonce
             or self._lwd_dp_of_settling(request_id) != dp_idx
         ):
             lwd_logger.warning(
@@ -860,6 +877,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # optimistically; the start offset must step back by this
             # step's amount
             offset = request.num_computed_tokens - num_tokens
+            # Edge embedding requests always carry real tokens
+            # (prompt_embeds is rejected at admission).
+            assert request.prompt_token_ids is not None
             req_has_mrope = request_id in self._lwd_mrope_positions_dict
             items.append(
                 LwdRangeItem(
@@ -867,7 +887,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                     offset=offset,
                     num_tokens=num_tokens,
                     has_mrope=req_has_mrope,
-                    prefix_nonce=getattr(request, "lwd_prefix_nonce", 0),
+                    prefix_nonce=request.lwd_prefix_nonce,
                 )
             )
             req_ids.append(request_id)
@@ -883,10 +903,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     def lwd_edge_abort(self, request_ids: list[str]) -> list[tuple[int, str]]:
         """Settle aborted requests and return their original DP routes."""
         aborted = set(request_ids)
+        pending_refills = getattr(self, "_lwd_pending_refills", ())
         self._lwd_pending_refills = deque(
             output
-            for output in getattr(self, "_lwd_pending_refills", ())
-            if not aborted.intersection(output.lwd_batch.batch_meta.req_ids)
+            for output in pending_refills
+            if output.lwd_batch is not None
+            and output.lwd_batch.batch_meta is not None
+            and not aborted.intersection(output.lwd_batch.batch_meta.req_ids)
         )
         routed_aborts = []
         for request_id in request_ids:
@@ -954,9 +977,11 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_validate_request(self, request: Request) -> None:
         """Mode boundary validation (edge capability surface): reject
-        client-provided prompt_embeds/pooling/structured output/sampling
-        params not carried on the wire; violations raise ValueError and are
-        rejected before enqueueing."""
+        client-provided prompt_embeds/pooling/sampling params not carried on
+        the wire; violations raise ValueError and are rejected before
+        enqueueing. Structured output is supported: the constraint rides
+        `LwdRequestNotify.structured_outputs`, the cloud compiles the grammar
+        and applies the bitmask at its sampling point."""
         if request.prompt_embeds is not None:
             raise ValueError(
                 f"[LWD] prefill-only mode does not accept client-provided "
@@ -969,12 +994,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 "[LWD] prefill-only mode does not support pooling requests "
                 f"(request {request.request_id})"
             )
-        if request.use_structured_output:
-            raise ValueError(
-                "[LWD] prefill-only mode does not support structured output "
-                f"(request {request.request_id})"
-            )
         sp = request.sampling_params
+        assert sp is not None
         unsupported = [
             name
             for name, value in (
@@ -1014,6 +1035,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 f"(request {request.request_id})"
             )
         mm_config = self.vllm_config.model_config.multimodal_config
+        assert mm_config is not None
         if mm_config.is_multimodal_pruning_enabled():
             raise ValueError(
                 "[LWD] prefill-only mode does not support multimodal "

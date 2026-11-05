@@ -22,12 +22,14 @@ if TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+    from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdC2eNotify
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     KVCacheBlockCopy = object
     LoRARequest = object
+    LwdC2eNotify = object
     MultiModalFeatureSpec = object
     PoolingParams = object
     SamplingParams = object
@@ -63,6 +65,10 @@ class LwdEmbedBatch:
     channel of this DP connection. 0 keeps single-cloud behaviour."""
     aborted_req_ids: list[str] = field(default_factory=list)
     is_refill: bool = False
+    # Prefix-reservation nonce this refill chunk belongs to (the cloud
+    # matches it against the request's current nonce to drop stale
+    # chunks); 0 on plain non-refill embed batches.
+    lwd_prefix_nonce: int = 0
 
 
 @dataclass
@@ -374,6 +380,9 @@ class SchedulerOutput:
 
     # LWD batch metadata dispatch to the worker.
     lwd_batch: LwdBatch | None = None
+    # Per-UNEMBED-batch C2E notify (set by lwd_build_unembed_batch; readers
+    # are guarded on batch_type == LWD_UNEMBED).
+    lwd_c2e_notify: list[LwdC2eNotify] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

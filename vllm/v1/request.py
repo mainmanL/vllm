@@ -234,6 +234,16 @@ class Request:
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
 
+        # LWD edge-cloud request state. Populated only in LWD deployments
+        # (edge admission or cloud rebuild); the defaults keep the plain
+        # engine untouched.
+        self.lwd_prefix_nonce: int = 0
+        self.lwd_mrope_positions: bytes = b""
+        self.lwd_wire_hashes_adopted: bool = False
+        # None = never refilled (cloud readmission treats it as floor 0).
+        self.lwd_resume_cap_tokens: int | None = None
+        self.lwd_window_cap: int | None = None
+
     @classmethod
     def from_engine_core_request(
         cls,

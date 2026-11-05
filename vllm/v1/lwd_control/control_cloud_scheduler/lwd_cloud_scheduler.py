@@ -42,7 +42,13 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.engine import EngineCoreOutputs
+    from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
+        LwdPrefixReservations,
+    )
     from vllm.v1.outputs import ModelRunnerOutput
 
 LwdDownCarrier = tuple[torch.Tensor, list[str], int, int]
@@ -88,6 +94,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
+        # Wired by the cloud engine at attach time (it owns the prefix-cache
+        # state): reservations pin negotiated blocks, the sender ships refill
+        # ranges back to the edge.
+        self.lwd_prefix_reservations: LwdPrefixReservations | None = None
+        self.lwd_refill_sender: Callable[[str, int, int, int], None] | None = None
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
     def has_requests(self) -> bool:
@@ -151,7 +162,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def _lwd_prep_prefix_readmission(self, request: Request) -> bool:
         """Freeze a preempted request's arrival-clamped hit before admission."""
         reservations = self.lwd_prefix_reservations
-        floor = getattr(request, "lwd_resume_cap_tokens", 0)
+        assert reservations is not None
+        floor = request.lwd_resume_cap_tokens
+        if floor is None:
+            floor = 0
+        groups: tuple[Sequence[KVCacheBlock], ...]
         if request.skip_reading_prefix_cache:
             groups, h_prime = (), 0
         else:
@@ -182,10 +197,10 @@ class LwdCloudScheduler(LwdBaseScheduler):
         if h_prime >= floor:
             return True
 
-        sender = getattr(self, "lwd_refill_sender", None)
+        sender = self.lwd_refill_sender
         if sender is None:
             raise RuntimeError("[LWD] refill channel is not wired")
-        prefix_nonce = getattr(request, "lwd_prefix_nonce", 0)
+        prefix_nonce = request.lwd_prefix_nonce
         self._lwd_refill_gate.add(request.request_id)
         self._lwd_refill_pending[request.request_id] = _LwdRefillPending(
             h_prime, prefix_nonce
@@ -209,7 +224,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 "[cloud-sched] stale refill_done req=%s ignored", request_id
             )
             return
-        current_nonce = getattr(request, "lwd_prefix_nonce", 0) if request else 0
+        current_nonce = request.lwd_prefix_nonce if request else 0
         if prefix_nonce != pending.prefix_nonce or (
             request is not None and current_nonce != pending.prefix_nonce
         ):
@@ -325,8 +340,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         for data in out.scheduled_new_reqs:
             request = self.requests.get(data.req_id)
             if request is not None:
-                positions = getattr(request, "lwd_mrope_positions", b"")
-                data.lwd_mrope_positions = b"" if positions is None else positions
+                data.lwd_mrope_positions = request.lwd_mrope_positions
 
     def finish_requests(
         self,
@@ -369,8 +383,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 seqno=-1,
                 batch_meta=LwdEmbedBatch(aborted_req_ids=list(pending)),
             )
-        elif (
-            batch.batch_type is LwdBatchType.LWD_EMBED and batch.batch_meta is not None
+        elif batch.batch_type is LwdBatchType.LWD_EMBED and isinstance(
+            batch.batch_meta, LwdEmbedBatch
         ):
             existing = list(batch.batch_meta.aborted_req_ids or ())
             batch.batch_meta.aborted_req_ids = existing + [
@@ -386,7 +400,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
         nonce_snapshot = {
-            request_id: getattr(request, "lwd_prefix_nonce", 0)
+            request_id: request.lwd_prefix_nonce
             for request_id, request in self.requests.items()
         }
         self._lwd_diag.observe_spec_acceptance(
