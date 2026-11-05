@@ -93,6 +93,7 @@ from vllm.model_executor.models.interfaces_base import (
     is_pooling_model,
     is_text_generation_model,
 )
+from vllm.model_executor.models.utils import lwd_role, lwd_skips_module
 from vllm.model_executor.offloader import (
     create_offloader,
     get_offloader,
@@ -6465,7 +6466,15 @@ class GPUModelRunner(
         # Profile with multimodal encoder & encoder cache.
         if self.supports_mm_inputs:
             mm_config = self.model_config.multimodal_config
-            if mm_config is not None and mm_config.skip_mm_profiling:
+            if lwd_skips_module("visual", lwd_role()):
+                # LWD roles that do not own the vision tower have no encoder to
+                # profile: the edge encodes and ships prompt embeddings. The
+                # encoder cache itself is created unconditionally.
+                logger.info(
+                    "Skipping multimodal encoder profiling: the vision tower "
+                    "belongs to the other LWD role."
+                )
+            elif mm_config is not None and mm_config.skip_mm_profiling:
                 logger.info(
                     "Skipping memory profiling for multimodal encoder and "
                     "encoder cache."
