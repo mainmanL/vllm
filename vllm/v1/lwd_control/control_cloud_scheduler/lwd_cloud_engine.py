@@ -26,7 +26,8 @@ from typing import Any
 import torch
 
 from vllm.lwd_logger import lwd_logger
-from vllm.sampling_params import SamplingParams
+from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.engine.core import DPEngineCoreProc, EngineCoreProc, EngineShutdownState
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_scheduler import (
@@ -54,6 +55,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRefillNotify,
     LwdRequestNotify,
     lwd_decode_edge_to_cloud,
+    lwd_decode_structured_outputs,
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.request import Request
@@ -131,6 +133,17 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self.scheduler.lwd_refill_sender = self._lwd_send_refill
 
     def _lwd_assemble(self) -> None:
+        if self.vllm_config.model_config.skip_tokenizer_init:
+            # StructuredOutputManager builds its tokenizer and compile
+            # executor only with a tokenizer; without one the first
+            # constrained request would crash at grammar_init. Fail fast at
+            # startup instead (the cloud slice ships the tokenizer per F2
+            # metadata rules).
+            raise ValueError(
+                "[LWD] the cloud engine requires its tokenizer "
+                "(skip_tokenizer_init=True is not supported): grammar "
+                "compilation and the sampling bitmask happen on the cloud"
+            )
         self._lwd_init_prefix_cache()
         self._lwd_ingest_thread: threading.Thread | None = None
         self._lwd_edge: LwdPeer | None = None
@@ -463,6 +476,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_prompt_lens[request_id] = notify.num_prompt_tokens
         self._lwd_request_nonces[request_id] = notify.prefix_nonce
         request = self._lwd_build_request(notify)
+        if request.use_structured_output:
+            # Wire-rebuilt requests bypass the native auto-compile entry
+            # (core.py::preprocess_add_request); without this explicit init
+            # the request would sit in WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+            # forever with no error.
+            self.structured_output_manager.grammar_init(request)
         self.input_queue.put_nowait((EngineCoreRequestType.ADD, (request, 0)))
         lwd_logger.info(
             "[cloud] request added req=%s tokens=%d nonce=%d",
@@ -578,7 +597,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             else 0
         )
 
-        def block_hasher(request: Request) -> list[bytes]:
+        def block_hasher(request: Request) -> list[BlockHash]:
             if request.num_output_tokens > 0:
                 return []
             if (
@@ -586,7 +605,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 and not request.block_hashes
                 and len(req_notify.block_hashes) == expected
             ):
-                return list(req_notify.block_hashes)
+                return [BlockHash(h) for h in req_notify.block_hashes]
             assert local_hasher is not None
             return local_hasher(request)
 
@@ -615,6 +634,18 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             skip_reading_prefix_cache=req_notify.skip_reading_prefix_cache,
         )
         sampling_params.update_from_generation_config({}, req_notify.eos_token_id)
+        if req_notify.structured_outputs:
+            # Decoded after update_from_generation_config so no later native
+            # hook re-validates and overwrites the edge-chosen `_backend`.
+            # Fail fast: a half-parsed request must never enter the queue.
+            try:
+                sampling_params.structured_outputs = lwd_decode_structured_outputs(
+                    req_notify.structured_outputs, StructuredOutputsParams
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"[LWD][cloud] request {req_notify.request_id}: {exc}"
+                ) from exc
         LwdControlDiag.cloud_request_admitted(req_notify, sampling_params)
         return sampling_params
 

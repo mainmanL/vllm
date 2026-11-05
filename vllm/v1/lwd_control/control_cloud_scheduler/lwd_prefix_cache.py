@@ -139,7 +139,8 @@ def prefix_start(
         return request.num_computed_tokens
     if reservations is not None and reservations.has(request.request_id):
         return reservations.hit_of(request.request_id)
-    return getattr(request, "lwd_resume_cap_tokens", 0)
+    resume_cap = getattr(request, "lwd_resume_cap_tokens", None)
+    return resume_cap if resume_cap is not None else 0
 
 
 class LwdPrefixCacheState(NamedTuple):
@@ -162,6 +163,7 @@ def init_lwd_prefix_cache(
     from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
     from vllm.v1.kv_cache_interface import (
         FullAttentionSpec,
+        KVCacheSpec,
         MambaSpec,
         SlidingWindowSpec,
         UniformTypeKVCacheSpecs,
@@ -179,7 +181,7 @@ def init_lwd_prefix_cache(
             "(prefill_context_parallel_size > 1)"
         )
 
-    specs = []
+    specs: list[KVCacheSpec] = []
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
         specs.extend(
