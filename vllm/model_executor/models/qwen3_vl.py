@@ -151,6 +151,8 @@ from .utils import (
     StageMissingLayer,
     WeightsMapper,
     _merge_multimodal_embeddings,
+    lwd_role,
+    lwd_skips_module,
     maybe_prefix,
 )
 from .vision import (
@@ -1860,16 +1862,19 @@ class Qwen3VLForConditionalGeneration(
         self._init_video_pruning(multimodal_config)
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
-                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+            if lwd_skips_module("visual", lwd_role()):
+                self.visual = PPMissingLayer()
+            else:
+                self.visual = Qwen3_VisionTransformer(
+                    config.vision_config,
+                    norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
 
         self.use_deepstack = hasattr(
             config.vision_config, "deepstack_visual_indexes"
-        ) and not isinstance(self.visual, StageMissingLayer)
+        ) and not isinstance(self.visual, (PPMissingLayer, StageMissingLayer))
         self.deepstack_num_level = (
             len(config.vision_config.deepstack_visual_indexes)
             if self.use_deepstack
