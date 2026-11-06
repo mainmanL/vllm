@@ -122,7 +122,7 @@ def lwd_role() -> str | None:
 3. **F2 单一事实源**：离线切分脚本 `import LWD_MODULE_OWNERSHIP` 拿到同一对象；若表挂在 LwdConfig 上，脚本就得构造 config 或复制规则，镜像纪律退化为约定。
 4. **源仓教训**：`skips_module` 挂在 LwdConfig 上，本次迁移中 `enabled`/`mode`/`edge_head_tail_layers` 全部作废，只有 `role` 有用——越靠近配置的策略越难跨仓迁移。
 
-### 3.4 模型守卫（5 处）
+### 3.4 模型守卫（7 处）
 
 守卫只建模块、不写 forward 分支（占位模块保住调用点签名）：
 
@@ -133,6 +133,8 @@ def lwd_role() -> str | None:
 | [qwen3_5.py](../../../vllm/model_executor/models/qwen3_5.py) :513 | visual 塔 | `visual` | 无守卫，需加 |
 | [qwen3_5.py](../../../vllm/model_executor/models/qwen3_5.py) :732 | merger/deepstack | 随 `visual` 整树 | 塔为 None 时不建 |
 | [qwen3_vl.py](../../../vllm/model_executor/models/qwen3_vl.py) :1862 | visual 塔 | `visual` | 无守卫，需加 |
+| [deepseek_v4/nvidia/model.py](../../../vllm/models/deepseek_v4/nvidia/model.py) :1417 | final norm | `model.norm` | V4 新 layout（非 model_executor 老布局）；已有 `is_last_rank` PP 分支，需在其上追加 LWD 条件 |
+| `vllm_ascend/models/deepseek_v4/model.py` :848 | final norm | `model.norm` | vllm-ascend 仓 NPU 覆写实现（真机实际路径），同样追加 LWD 条件，随 vllm-ascend 侧 PR |
 
 调用形式（以 visual 塔为例）：
 
@@ -171,6 +173,8 @@ else:
 ⇒ 边不建 norm 不会让回放缺 norm；边建 norm 反而是死权重（占显存 + `named_parameters()` 污染 + F2 被迫双写）。
 
 **入表前复核（写进守卫清单的纪律）**：`compute_logits` 契约**不是全域一致**——[dspark.py:2362](../../../vllm/model_executor/models/dspark.py) 的实现内含 `self.model.norm(hidden_states)`（其输入是 pre-norm residual，契约不同）。今后把新模型族加入边侧支持列表前，必须复核其 `compute_logits` 不含 norm，否则回放会双重 norm。
+
+**V4 家族复核（2026-11-06，随守卫补丁）**：V4 走新 layout（`vllm/models/deepseek_v4/`，NPU 上由 vllm-ascend 覆写 `vllm_ascend/models/deepseek_v4/model.py`），不在 `model_executor/models/` 老布局下。两侧实现的 `compute_logits` 均为 `logits_processor(self.lm_head, hidden_states)`，不含 norm——契约干净，`model.norm` → cloud 适用于 V4；DeepSeek-V4-Flash 边云裁剪真机部署回放正常。层裁剪经 `make_layers` 公共 LWD 分支天然生效。V4-Flash 为纯文本模型（`vision_n_layers = 0`）无视觉塔可裁，V4-VL 上边侧时 visual 站点按同纪律补守卫；mtp 在 vLLM 中是独立 draft 模型类，edge 不启 spec decode 即不构建，无守卫站点。
 
 ## 4. 装载期兜底：`lwd_weight_filter`（D4 定案）
 
