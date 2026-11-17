@@ -1,0 +1,10 @@
+{
+  "kv_connector": "MooncakeConnectorV1",
+  "kv_role": "kv_consumer",
+  "kv_rank": 1,
+  "kv_port": 14580,
+  "kv_connector_extra_config": {
+    "prefill": {"dp_size": 2, "tp_size": 4},
+    "decode": {"dp_size": 4, "tp_size": 4}
+  }
+}

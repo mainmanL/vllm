@@ -2,9 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """Pure functions for edge-side prefill batch assembly: resume-first +
-FCFS prefix + tail truncation (PD_mix is the only supported form; the
-single-request escape hatch for PD-disaggregated mode was removed along
-with the phase machine).
+FCFS prefix + tail truncation. PD stage bindings constrain the candidates
+before invoking this picker; placement remains the Proxy's responsibility.
 
 chunk semantics follow lwd_chunked_prefill_design.md §3.1; called by the
 LwdEdgeScheduler adapter layer after it assembles candidates. Inputs and

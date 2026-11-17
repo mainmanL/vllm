@@ -18,10 +18,10 @@ import msgspec
 
 T = TypeVar("T")
 
-# Version 5: LwdRequestNotify carries `structured_outputs`. An old cloud would
-# drop the constraint silently (msgspec skips unknown fields on decode), so
-# mixed versions fail the handshake instead of serving unstructured output.
-LWD_MESSAGE_VERSION = 5
+# Version 6: PD identities, ranges and result commitments are mandatory on PD
+# connections. Mixed versions fail the handshake instead of dropping fields.
+LWD_MESSAGE_VERSION = 6
+LWD_PD_VERSION = "lwd-pd-v2"
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""
@@ -43,6 +43,9 @@ class LwdRangeItem(msgspec.Struct, gc=False):  # type: ignore[call-arg]
     """Out-of-band embedding refill after cloud preemption."""
     prefix_nonce: int = 0
     """Generation of the request that owns this chunk."""
+    attempt_id: str = ""
+    binding_id: str = ""
+    window_id: int = 0
 
 
 class LwdRangeNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -108,6 +111,10 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     `StructuredOutputsParams`; empty for a plain request. The cloud rebuilds
     the params, compiles the grammar and applies the sampling bitmask; the
     edge compiles its own copy only for the picker's grammar-ready filter."""
+    attempt_id: str = ""
+    binding_id: str = ""
+    stage_role: str = ""
+    fingerprint: str = ""
 
 
 def lwd_encode_structured_outputs(params: Any) -> str:
@@ -187,6 +194,8 @@ class LwdAbortNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-a
     request_id: str
     prefix_nonce: int = 0
     """Generation to abort; zero is the legacy form."""
+    attempt_id: str = ""
+    binding_id: str = ""
 
 
 class LwdGenChainNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -228,6 +237,8 @@ class LwdCloudParamsNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[
     prefix_alignment_required: bool = False
     prefix_use_eagle: bool = False
     prefix_hash_block_size: int = 0
+    pd_version: str = ""
+    stage_role: str = ""
 
 
 class LwdPrefixReadyNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg]
@@ -271,6 +282,67 @@ class LwdC2eNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call-arg
     edge skips sampling."""
     prefix_nonces: list[int] = []
     """Generation of each request row, aligned with req_ids."""
+    attempt_ids: list[str] = []
+    binding_ids: list[str] = []
+    valid_ranges: list[list[int]] = []
+    row_counts: list[int] = []
+    final_g: list[int] = []
+    range_digests: list[str] = []
+
+
+class LwdPdBindNotify(msgspec.Struct, gc=False, tag=True):
+    request_id: str
+    attempt_id: str
+    stage_role: str
+    binding_id: str
+    fingerprint: str
+    cloud_id: int
+    dp_idx: int
+    accepted: bool = True
+    error: str = ""
+    hit_tokens: int = 0
+    p_end: int = 0
+    i_end: int = 0
+    r_pos: int = 0
+    max_window_tokens: int = 0
+    max_inflight_windows: int = 0
+    recv_windows: int = 0
+    source_p_binding: str = ""
+    source_export_id: str = ""
+    ttl_s: float = 0.0
+
+
+class LwdPdStageDoneNotify(msgspec.Struct, gc=False, tag=True):
+    request_id: str
+    attempt_id: str
+    binding_id: str
+    export_id: str = ""
+    ok: bool = True
+    error: str = ""
+
+
+class LwdPdQuotaNotify(msgspec.Struct, gc=False, tag=True):
+    request_id: str
+    attempt_id: str
+    binding_id: str
+    kind: str
+    watermark: int
+
+
+class LwdPdResultCommit(msgspec.Struct, gc=False, tag=True):
+    request_id: str
+    attempt_id: str
+    binding_id: str
+    accepted_tokens: int
+    frontend_reason: str
+    verified_tokens: int
+
+
+class LwdPdResultReceipt(msgspec.Struct, gc=False, tag=True):
+    request_id: str
+    attempt_id: str
+    binding_id: str
+    result: dict[str, Any]
 
 
 LwdEdgeToCloudMessage: TypeAlias = (
@@ -279,9 +351,18 @@ LwdEdgeToCloudMessage: TypeAlias = (
     | LwdAbortNotify
     | LwdGenChainNotify
     | LwdFinishNotify
+    | LwdPdQuotaNotify
+    | LwdPdResultCommit
 )
 LwdCloudToEdgeMessage: TypeAlias = (
-    LwdCloudParamsNotify | LwdC2eNotify | LwdPrefixReadyNotify | LwdRefillNotify
+    LwdCloudParamsNotify
+    | LwdC2eNotify
+    | LwdPrefixReadyNotify
+    | LwdRefillNotify
+    | LwdPdBindNotify
+    | LwdPdStageDoneNotify
+    | LwdPdQuotaNotify
+    | LwdPdResultReceipt
 )
 LwdMessage: TypeAlias = LwdEdgeToCloudMessage | LwdCloudToEdgeMessage
 

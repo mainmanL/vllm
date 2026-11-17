@@ -426,6 +426,13 @@ class Scheduler(SchedulerInterface):
         than the configured prefill chunk limit, intermediate chunks keep
         private running state until they reach the next cacheable position.
         """
+        # PD imports the exact state at R. Its final real-input window must
+        # not be rounded to an unrelated prefix-cache checkpoint boundary.
+        if (
+            getattr(request, "lwd_pd_stage_role", "") == "decode"
+            and getattr(request, "lwd_window_cap", None) is not None
+        ):
+            return num_new_tokens
         start = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
@@ -1027,6 +1034,15 @@ class Scheduler(SchedulerInterface):
                 external_load_encoder_input = []
                 new_encoder_compute_budget = encoder_compute_budget
                 pad_spec_decode = False
+
+                if getattr(request, "lwd_pd_import_only", False) and not load_kv_async:
+                    # A PD decode has no prompt embeddings to fall back to.
+                    # Let its role scheduler fail this request after native
+                    # scheduling, without dispatching placeholder computation.
+                    request.lwd_pd_import_failed = True
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
 
                 if load_kv_async:
                     # KVTransfer: loading remote KV, do not allocate for new work.

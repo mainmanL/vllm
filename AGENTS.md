@@ -1,5 +1,16 @@
 # LWD 边云分布式推理系统
 
+## Host PD implementation
+
+PD is configured through `deployment.pd` and cloud `stage_role` in the LWD
+topology. `vllm/v1/lwd_control/pd/` owns the Proxy, stage binding, bounded control
+outboxes and frontend G/K result protocol. Only host transport is supported;
+P/D DP sizes are independent and each edge uses native DP=1. PD requires an
+explicit shared host UP buffer capacity. P keeps arrival staging; D receives a
+small owned tail buffer. PD preemption fails explicitly. See
+[the implementation contract](docs/design/lwd_pd_host.md) and
+[CPU validation and test inventory](docs/design/lwd_pd_cpu_validation.md).
+
 > [!NOTE]
 > **本文件定位**: 团队隐形知识的载体. 团队隐性知识(代码位置、设计意图、约定、边界)必须落入本文件, 而不是留在成员脑中口口相传.
 > 录入重点是隐形知识, 不是具体操作步骤 —— agent 通用具备的技能(如 git 命令用法)不记录.

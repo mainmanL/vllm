@@ -62,8 +62,10 @@ class LwdEmbedBatch:
     connection_id: LwdConnectionId = LwdConnectionId(0, 0, 0)
     """Full edge -> cloud DP connection; the worker selects its UP channel."""
     aborted_req_ids: list[str] = field(default_factory=list)
+    aborted_pd_bindings: dict[str, tuple[str, str]] = field(default_factory=dict)
     is_refill: bool = False
     lwd_prefix_nonce: int = 0
+    retain_mm_req_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -88,6 +90,8 @@ class LwdUnembedBatch:
     )  # diagnostic bypass: per-request accepted token ids from cloud (skip-sample mode)
     connection_id: LwdConnectionId = LwdConnectionId(0, 0, 0)
     """Full edge -> cloud DP connection; the worker selects its DOWN channel."""
+    physical_rows: list[int] = field(default_factory=list)
+    valid_rows: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -112,6 +116,12 @@ class NewRequestData:
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
     lwd_mrope_positions: bytes = b""
+    lwd_pd_stage_role: str = ""
+    lwd_pd_binding_id: str = ""
+    lwd_pd_attempt_id: str = ""
+    lwd_pd_tail_start: int = 0
+    lwd_pd_tail_end: int = 0
+    lwd_pd_suppress_user_output: bool = False
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
@@ -140,6 +150,14 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             lwd_mrope_positions=getattr(request, "lwd_mrope_positions", b""),
+            lwd_pd_stage_role=getattr(request, "lwd_pd_stage_role", ""),
+            lwd_pd_binding_id=getattr(request, "lwd_pd_binding_id", ""),
+            lwd_pd_attempt_id=getattr(request, "lwd_pd_attempt_id", ""),
+            lwd_pd_tail_start=getattr(request, "lwd_pd_tail_start", 0),
+            lwd_pd_tail_end=getattr(request, "lwd_pd_tail_end", 0),
+            lwd_pd_suppress_user_output=getattr(
+                request, "lwd_pd_suppress_user_output", False
+            ),
             prefill_token_ids=prefill_token_ids,
         )
 
@@ -374,6 +392,10 @@ class SchedulerOutput:
 
     # LWD batch metadata dispatch to the worker.
     lwd_batch: LwdBatch | None = None
+    # Worker capture-time snapshots, carried by the corresponding output only.
+    lwd_pd_suppressed_req_ids: frozenset[str] = frozenset()
+    lwd_pd_tail_consumed: frozenset[str] = frozenset()
+    lwd_pd_request_identities: dict[str, tuple[str, str]] = field(default_factory=dict)
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

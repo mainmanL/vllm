@@ -50,6 +50,7 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import unwrap_req_id, wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_link_protocol import LwdPeer
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
+    LWD_PD_VERSION,
     LWD_SAMPLING_DEFAULTS,
     LwdAbortNotify,
     LwdC2eNotify,
@@ -57,6 +58,8 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdCloudToEdgeMessage,
     LwdEdgeToCloudMessage,
     LwdMessage,
+    LwdPdQuotaNotify,
+    LwdPdResultCommit,
     LwdPrefixReadyNotify,
     LwdRangeNotify,
     LwdRefillNotify,
@@ -115,6 +118,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         if (
             vllm_config.cache_config.enable_prefix_caching
             and getattr(vllm_config, "kv_transfer_config", None) is not None
+            and not getattr(
+                getattr(getattr(vllm_config, "lwd_config", None), "pd", None),
+                "enabled",
+                False,
+            )
         ):
             raise ValueError(
                 "[LWD] prefix caching with KV connector is unsupported: "
@@ -256,6 +264,24 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self._lwd_engine_index = int(
             self.vllm_config.parallel_config.data_parallel_index
         )
+        self._lwd_pd_runtime = None
+        if getattr(self.lwd_config.pd, "enabled", False):
+            from vllm.v1.lwd_control.pd.cloud_runtime import LwdPdCloudRuntime
+
+            if self.vllm_config.kv_transfer_config is None:
+                raise ValueError(
+                    "[LWD] PD requires a KV connector on both cloud stages"
+                )
+            if (
+                self.lwd_config.stage_role == "decode"
+                and 0
+                < self.lwd_config.pd.d_output_quota_rows
+                < lwd_spec_factor(self.vllm_config)
+            ):
+                raise ValueError(
+                    "[LWD] PD output row window cannot hold one MTP decode step"
+                )
+            self._lwd_pd_runtime = LwdPdCloudRuntime(self)
         sched_config = self.vllm_config.scheduler_config
         # Scheduling limits are checked by the edge. The coordinator address
         # lets the edge
@@ -272,12 +298,16 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             prefix_alignment_required=self._lwd_prefix_state.alignment_required,
             prefix_use_eagle=self._lwd_prefix_state.use_eagle,
             prefix_hash_block_size=prefix_hash_block_size,
+            pd_version=LWD_PD_VERSION if self._lwd_pd_runtime is not None else "",
+            stage_role=self.lwd_config.stage_role,
         )
         self._lwd_register_recv_hint()
         # Business messages are handed to the engine input queue. Request,
         # reservation, routing and coordinator state therefore have one owner:
         # the engine thread, same as the native scheduler and KV manager.
         plane = self._lwd_start_control_plane()
+        if self._lwd_pd_runtime is not None:
+            self._lwd_pd_runtime.start()
         lwd_logger.info(
             "[LWD][cloud] engine assembled: control plane on %s", plane.endpoint
         )
@@ -301,7 +331,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Engine thread: remember the edge and send it the scheduling
         limits before anything else."""
         self._lwd_edges.add(peer)
-        self._lwd_send_until_queued(peer, self._lwd_cloud_params)
+        if self._lwd_pd_runtime is not None:
+            self._lwd_pd_runtime.send(peer, self._lwd_cloud_params)
+        else:
+            self._lwd_send_until_queued(peer, self._lwd_cloud_params)
         lwd_logger.info(
             "[LWD][cloud] edge %s registered; scheduling limits sent: %s",
             peer,
@@ -365,6 +398,24 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
 
     def add_request(self, request: Request, request_wave: int = 0) -> None:
+        runtime = getattr(self, "_lwd_pd_runtime", None)
+        if runtime is not None and getattr(request, "lwd_pd_stage_role", ""):
+            ctx = runtime.match(
+                request.request_id, request.lwd_pd_attempt_id, request.lwd_pd_binding_id
+            )
+            if ctx is None or ctx.terminal or ctx.request is not request:
+                # RequestNotify enqueues ADD. A following cancel can be
+                # ingested before that ADD is handled; it must not resurrect
+                # the canceled stage after its pin and result were released.
+                return
+            # The HTTP registration already pinned the authoritative P
+            # snapshot. The claim must not run ordinary reserve/READY again.
+            try:
+                super().add_request(request, request_wave)
+            except Exception:
+                runtime.fail(request.request_id, "PD native admission failed")
+                raise
+            return
         nonce = getattr(request, "lwd_prefix_nonce", 0)
         if not nonce:
             if self._lwd_prefix_enabled:
@@ -453,6 +504,8 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 LwdRangeNotify,
                 LwdRequestNotify,
                 LwdAbortNotify,
+                LwdPdQuotaNotify,
+                LwdPdResultCommit,
             ),
         ):
             return False
@@ -488,6 +541,18 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             getattr(msg, "seqno", "-"),
         )
         connection_id = self._lwd_connection_of(peer)
+        runtime = getattr(self, "_lwd_pd_runtime", None)
+        if isinstance(msg, (LwdPdQuotaNotify, LwdPdResultCommit)):
+            if runtime is None:
+                raise ValueError("PD control message on a non-PD cloud")
+            canonical = msgspec.structs.replace(
+                msg, request_id=wrap_req_id(peer.instance_id, msg.request_id)
+            )
+            if isinstance(canonical, LwdPdResultCommit):
+                runtime.commit(peer, canonical)
+            else:
+                runtime.quota(peer, canonical)
+            return
         if connection_id in self._lwd_ledger.failed_connections:
             if isinstance(msg, LwdRequestNotify):
                 from vllm.v1.engine import FinishReason
@@ -521,15 +586,37 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         canonical_id = wrap_req_id(peer.instance_id, msg.request_id)
         msg = msgspec.structs.replace(msg, request_id=canonical_id)
         if isinstance(msg, LwdRequestNotify):
+            if runtime is not None:
+                if not msg.stage_role:
+                    raise ValueError(
+                        "PD cloud refuses requests without a stage binding"
+                    )
+                try:
+                    runtime.claim(peer, msg)
+                except ValueError as exc:
+                    lwd_logger.warning(
+                        "[pd] claim rejected req=%s: %s", msg.request_id, exc
+                    )
+                    if (
+                        runtime.match(msg.request_id, msg.attempt_id, msg.binding_id)
+                        is not None
+                    ):
+                        runtime.fail(msg.request_id, str(exc))
+                return
             self._lwd_ledger.retired_routes.pop(canonical_id, None)
             self._lwd_ledger.request_routes[canonical_id] = peer
             self._lwd_handle_request_notify(msg)
         else:
+            if runtime is not None:
+                runtime.abort(canonical_id, msg.attempt_id, msg.binding_id)
+                return
             self._lwd_handle_abort_notify(msg)
 
     def _lwd_connection_of(self, peer: LwdPeer) -> LwdConnectionId:
         return LwdConnectionId(
-            peer.instance_id, self.lwd_config.instance_id, peer.dp_rank
+            peer.instance_id,
+            self.lwd_config.instance_id,
+            getattr(self, "_lwd_engine_index", peer.dp_rank),
         )
 
     def _lwd_handle_range_notify(
@@ -550,6 +637,12 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             )
             for request_id in request_ids
         ]
+        runtime = getattr(self, "_lwd_pd_runtime", None)
+        if runtime is not None:
+            prompt_lens = [
+                runtime.validate_range(connection_id, item, notify.seqno)
+                for item in items
+            ]
         if any(prompt_len <= 0 for prompt_len in prompt_lens):
             raise RuntimeError(
                 f"[LWD] RangeNotify seqno={notify.seqno} arrived before "
@@ -575,6 +668,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             "prompt_lens": prompt_lens,
             "prefix_nonces": [item.prefix_nonce for item in items],
         }
+        if runtime is not None:
+            hint_fields["binding_ids"] = [item.binding_id for item in items]
+            hint_fields["attempt_ids"] = [item.attempt_id for item in items]
         if any(item.is_refill for item in items):
             hint_fields["refills"] = [item.is_refill for item in items]
         post_irecv_hint(
@@ -645,7 +741,25 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         self.input_queue.put_nowait((EngineCoreRequestType.ABORT, [request_id]))
 
     def shutdown(self) -> None:
+        runtime = getattr(self, "_lwd_pd_runtime", None)
+        if runtime is not None:
+            runtime.close()
         super().shutdown()
+
+    def abort_requests(self, request_ids: list[str]) -> None:
+        runtime = getattr(self, "_lwd_pd_runtime", None)
+        if runtime is None:
+            super().abort_requests(request_ids)
+            return
+        ordinary = []
+        for request_id in request_ids:
+            ctx = runtime.active.get(request_id)
+            if ctx is None:
+                ordinary.append(request_id)
+            else:
+                runtime.abort(request_id, ctx.attempt_id, ctx.binding_id)
+        if ordinary:
+            super().abort_requests(ordinary)
 
     def _lwd_build_request(self, req_notify: LwdRequestNotify) -> Request:
         """Build a placeholder request and adopt the edge's native wire hashes
@@ -744,7 +858,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self, "cloud_control_processor", self._lwd_control_processor
         )
         if processor is not None:
-            processor.poll(probe_query)
+            runtime = getattr(self, "_lwd_pd_runtime", None)
+            processor.poll(probe_query, pd_handler=runtime.command if runtime else None)
+            if runtime is not None:
+                runtime.sweep()
 
     def has_work(self) -> bool:
         # Native WAKEUP reevaluates this predicate even when the scheduler is
@@ -780,6 +897,11 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdUsage
 
         for request_id, (prompt_tokens, completion_tokens) in list(records.items()):
+            runtime = getattr(self, "_lwd_pd_runtime", None)
+            if runtime is not None and request_id in runtime.active:
+                # P exports and D G/K results have their own stage lifetime.
+                records.pop(request_id, None)
+                continue
             cached_tokens = self._lwd_ledger.prefix_hits.get(request_id, 0)
             usage = LwdUsage(
                 prompt_tokens=prompt_tokens,
@@ -868,6 +990,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         advanced = record_irecv_completions(watermark_items)
         for connection, _, seqno in advanced:
             self._lwd_ledger.complete_seqno(connection, seqno)
+            runtime = getattr(self, "_lwd_pd_runtime", None)
+            if runtime is not None:
+                runtime.complete_seqno(connection, seqno)
         lwd_logger.info(
             "[LWD][pre-recv] DRAIN n=%d advanced=%s ts=%.3f",
             len(watermark_items),
@@ -923,9 +1048,21 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 or request_id in ledger.retired_req_ids
             ):
                 continue
+            runtime = getattr(self, "_lwd_pd_runtime", None)
+            if runtime is not None and not runtime.note_arrival(
+                connection_id, seqno, request_id, rows
+            ):
+                continue
             previous = self.scheduler.lwd_recv_rows.get(request_id, 0)
             if rows > previous:
                 self.scheduler.lwd_recv_rows[request_id] = rows
+                pd_scheduling = getattr(self.scheduler, "lwd_pd_scheduling", None)
+                if pd_scheduling is not None:
+                    pd_scheduling.note_arrival(request_id, rows)
+                runtime = getattr(self, "_lwd_pd_runtime", None)
+                ctx = runtime.active.get(request_id) if runtime is not None else None
+                if ctx is not None and ctx.terminal:
+                    runtime.return_input_credit(ctx, rows)
                 touched.append((request_id, previous, rows))
         if touched:
             lwd_logger.info("[LWD][cloud] arrival high watermarks updated: %s", touched)
@@ -960,6 +1097,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         """Flush pending c2e to the edge at the end of the step (the
         scheduler only queues them; both native step paths reach this hook)."""
         self._lwd_log_cloud_concurrency()
+        runtime = getattr(self, "_lwd_pd_runtime", None)
+        if runtime is not None:
+            runtime.ensure_terminals(self.scheduler.pending_c2e)
         if self.scheduler.pending_c2e:
             finished_ids: list[str] = []
             for notify in self.scheduler.pending_c2e:
@@ -982,7 +1122,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                         unwrap_req_id(request_id) for request_id in notify.req_ids
                     ],
                 )
-                self._lwd_send_until_queued(peer, restored)
+                if runtime is not None:
+                    runtime.send(peer, restored)
+                else:
+                    self._lwd_send_until_queued(peer, restored)
                 # Finished routes stay pinned until every pending C2E has
                 # flushed; later zero-accepted/retirement notices are legal.
                 for index, request_id in enumerate(notify.req_ids):

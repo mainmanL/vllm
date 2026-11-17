@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import msgspec
 import torch
 
 from vllm.lwd_logger import lwd_logger
@@ -119,6 +120,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self.lwd_hash_block_size = 0
         self.lwd_prefix_hits: dict[str, int] = {}
         self.lwd_refill_sender = None
+        self.lwd_pd_scheduling = None
+        self.lwd_pd_runtime = None
+        pd_config = getattr(self.vllm_config.lwd_config, "pd", None)
+        if pd_config is not None and pd_config.enabled:
+            from vllm.v1.lwd_control.pd.cloud_scheduler import LwdPdCloudScheduling
+
+            self.lwd_pd_scheduling = LwdPdCloudScheduling(self)
+            # PD imports must fail explicitly; they cannot recompute absent
+            # prompt embeddings on a connector load failure.
+            self.recompute_kv_load_failures = False
         lwd_logger.info("[cloud-sched] arrival-driven prefill/decode scheduling")
 
     def has_requests(self) -> bool:
@@ -126,6 +137,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return bool(self._lwd_abort_pending) or super().has_requests()
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
+        if (
+            getattr(self, "lwd_pd_scheduling", None) is not None
+            and self.vllm_config.lwd_config.stage_role == "decode"
+        ):
+            out = self.lwd_pd_scheduling.schedule()
+            self._lwd_pd_check_preemption(out)
+            self._lwd_attach_mrope_positions(out)
+            self._lwd_attach_abort_notice(out)
+            self.lwd_pd_runtime.capture_schedule(out)
+            return out
         decode_ids = self._lwd_collect_decode_requests()
         decode_exact = self._lwd_compute_decode_consumption(decode_ids)
         room = self.max_num_scheduled_tokens - decode_exact
@@ -139,7 +160,17 @@ class LwdCloudScheduler(LwdBaseScheduler):
             self._lwd_warn_under_scheduled(out, windows)
         self._lwd_attach_mrope_positions(out)
         self._lwd_attach_abort_notice(out)
+        self._lwd_pd_check_preemption(out)
+        runtime = getattr(self, "lwd_pd_runtime", None)
+        if runtime is not None:
+            runtime.capture_schedule(out)
         return out
+
+    def _lwd_pd_check_preemption(self, out: SchedulerOutput) -> None:
+        runtime = getattr(self, "lwd_pd_runtime", None)
+        if runtime is not None:
+            for request_id in out.preempted_req_ids or ():
+                runtime.fail(request_id, "PD preemption recovery is unsupported")
 
     def _lwd_collect_decode_requests(self) -> list[str]:
         return [
@@ -275,6 +306,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
             request_id = request.request_id
             if request_id in self._lwd_dropped or request.is_finished():
                 continue
+            if getattr(request, "lwd_pd_stage_role", "") and request.num_preemptions:
+                runtime = getattr(self, "lwd_pd_runtime", None)
+                if runtime is not None:
+                    runtime.fail(request_id, "PD preemption recovery is unsupported")
+                continue
             start = request.num_computed_tokens
             if prefix_enabled:
                 if request_id in self._lwd_refill_gate:
@@ -295,7 +331,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
             if arrived <= 0:
                 continue
             num_rows = min(arrived, room)
-            if num_rows < room and recv_rows < request.num_prompt_tokens:
+            if (
+                num_rows < room
+                and recv_rows < request.num_prompt_tokens
+                and getattr(request, "lwd_pd_stage_role", "") != "prefill"
+            ):
                 continue
             windows.append(_LwdPrefillWindow(request, num_rows, start))
             room -= num_rows
@@ -440,6 +480,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
             ]
         else:
             return
+        pd_bindings = getattr(self, "_lwd_aborted_pd_bindings", None)
+        if pd_bindings:
+            assert out.lwd_batch is not None and out.lwd_batch.batch_meta is not None
+            out.lwd_batch.batch_meta.aborted_pd_bindings = dict(pd_bindings)
+            pd_bindings.clear()
         self._lwd_abort_pending = []
 
     def update_from_output(
@@ -457,12 +502,32 @@ class LwdCloudScheduler(LwdBaseScheduler):
         engine_core_outputs = super().update_from_output(
             scheduler_output, model_runner_output
         )
+        pd_scheduling = getattr(self, "lwd_pd_scheduling", None)
+        if pd_scheduling is not None:
+            pd_scheduling.reconcile_rows(scheduler_output, model_runner_output)
+            pd_scheduling.consumed(
+                set(getattr(model_runner_output, "lwd_pd_tail_consumed", ()) or ()),
+                getattr(model_runner_output, "lwd_pd_tail_identities", {}),
+            )
+        runtime = getattr(self, "lwd_pd_runtime", None)
+        if runtime is not None:
+            runtime.completed(scheduler_output)
+            runtime.on_outputs(engine_core_outputs, scheduler_output)
         self._lwd_cleanup_arrivals(engine_core_outputs)
         carriers = getattr(model_runner_output, "lwd_down_carriers", None)
         if carriers:
             for carrier in carriers:
                 self._lwd_append_carrier_c2e(
-                    carrier[:4], engine_core_outputs, nonce_snapshot
+                    carrier[:4],
+                    engine_core_outputs,
+                    nonce_snapshot,
+                    pd_metadata=(
+                        getattr(model_runner_output, "lwd_pd_down_metadata", {}).get(
+                            (carrier[4], carrier[3])
+                        )
+                        if len(carrier) > 4
+                        else None
+                    ),
                 )
         elif LwdControlDiag.disable_down_enabled():
             self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
@@ -488,14 +553,22 @@ class LwdCloudScheduler(LwdBaseScheduler):
         carrier: LwdDownCarrier,
         engine_core_outputs: dict[int, EngineCoreOutputs],
         nonce_snapshot: dict[str, int],
+        pd_metadata: dict[str, Any] | None = None,
     ) -> None:
         meta = self._lwd_carrier_to_meta(carrier)
+        physical_rows = list(meta.num_accepted_tokens)
         committed = {
             out.request_id: len(out.new_token_ids)
             for outputs in engine_core_outputs.values()
             for out in outputs.outputs
         }
         meta.num_accepted_tokens = [committed.get(rid, 0) for rid in meta.req_ids]
+        runtime = getattr(self, "lwd_pd_runtime", None)
+        if runtime is not None:
+            meta.top_id_ths = [
+                ranks[:count]
+                for ranks, count in zip(meta.top_id_ths, meta.num_accepted_tokens)
+            ]
         LwdControlDiag.cloud_step(self, meta, engine_core_outputs)
         finish_reasons = self._lwd_c2e_finish_reasons(meta.req_ids, engine_core_outputs)
         LwdControlDiag.trace_cloud_c2e_rows(
@@ -509,24 +582,28 @@ class LwdCloudScheduler(LwdBaseScheduler):
             token_ids = LwdControlDiag.bypass_token_payload(
                 meta.req_ids, engine_core_outputs
             )
-        self.pending_c2e.append(
-            LwdC2eNotify(
-                hidden_num_elements=meta.hidden_num_elements,
-                top_id_ths=meta.top_id_ths,
-                num_accepted_tokens=meta.num_accepted_tokens,
-                req_ids=meta.req_ids,
-                finish_reasons=finish_reasons,
-                down_seqno=meta.down_seqno,
-                token_ids=token_ids,
-                prefix_nonces=self._lwd_c2e_prefix_nonces(meta.req_ids, nonce_snapshot),
-            )
+        notify = LwdC2eNotify(
+            hidden_num_elements=meta.hidden_num_elements,
+            top_id_ths=meta.top_id_ths,
+            num_accepted_tokens=meta.num_accepted_tokens,
+            req_ids=meta.req_ids,
+            finish_reasons=finish_reasons,
+            down_seqno=meta.down_seqno,
+            token_ids=token_ids,
+            prefix_nonces=self._lwd_c2e_prefix_nonces(meta.req_ids, nonce_snapshot),
         )
+        if runtime is not None:
+            notify = runtime.annotate(notify, physical_rows, pd_metadata)
+        self.pending_c2e.append(notify)
 
     def _lwd_append_diag_c2e(
         self,
         engine_core_outputs: dict[int, EngineCoreOutputs],
         nonce_snapshot: dict[str, int],
     ) -> None:
+        runtime = getattr(self, "lwd_pd_runtime", None)
+        if runtime is not None and runtime.stage_role == "prefill":
+            return
         rows = LwdControlDiag.disable_down_rows(engine_core_outputs)
         if not rows:
             return
@@ -536,22 +613,27 @@ class LwdCloudScheduler(LwdBaseScheduler):
             rows_by_edge.setdefault(edge_id, {})[request_id] = token_ids
         for edge_rows in rows_by_edge.values():
             request_ids = list(edge_rows)
-            self.pending_c2e.append(
-                LwdC2eNotify(
-                    hidden_num_elements=0,
-                    top_id_ths=[],
-                    num_accepted_tokens=[],
-                    req_ids=request_ids,
-                    finish_reasons=self._lwd_c2e_finish_reasons(
-                        request_ids, engine_core_outputs
-                    ),
-                    down_seqno=-1,
-                    token_ids=[edge_rows[request_id] for request_id in request_ids],
-                    prefix_nonces=self._lwd_c2e_prefix_nonces(
-                        request_ids, nonce_snapshot
-                    ),
-                )
+            notify = LwdC2eNotify(
+                hidden_num_elements=0,
+                top_id_ths=[],
+                num_accepted_tokens=[],
+                req_ids=request_ids,
+                finish_reasons=self._lwd_c2e_finish_reasons(
+                    request_ids, engine_core_outputs
+                ),
+                down_seqno=-1,
+                token_ids=[edge_rows[request_id] for request_id in request_ids],
+                prefix_nonces=self._lwd_c2e_prefix_nonces(request_ids, nonce_snapshot),
             )
+            if runtime is not None:
+                counts = [len(edge_rows[request_id]) for request_id in request_ids]
+                notify = msgspec.structs.replace(
+                    notify,
+                    num_accepted_tokens=counts,
+                    top_id_ths=[[] for _ in request_ids],
+                )
+                notify = runtime.annotate(notify, counts, diagnostic=True)
+            self.pending_c2e.append(notify)
 
     @staticmethod
     def _lwd_carrier_to_meta(carrier: LwdDownCarrier) -> LwdC2eMeta:

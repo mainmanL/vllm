@@ -8,6 +8,7 @@ import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
 from typing import Any
+from uuid import uuid4
 
 import vllm.envs as envs
 from vllm import TokensPrompt
@@ -52,6 +53,11 @@ from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollec
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
+from vllm.v1.lwd_control.pd.lwd_frontend_result import (
+    LwdFrontendReason,
+    LwdFrontendResultHandoff,
+    LwdFrontendResultInbox,
+)
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -152,6 +158,15 @@ class AsyncLLM(EngineClient):
             else None
         )
 
+        lwd = getattr(vllm_config, "lwd_config", None)
+        self._lwd_pd_results = (
+            LwdFrontendResultInbox(lwd.pd.result_hold_timeout_s)
+            if lwd is not None and lwd.role == "edge" and lwd.pd.enabled
+            else None
+        )
+        self._lwd_pd_handoff: LwdFrontendResultHandoff | None = None
+        self._lwd_pd_result_task: asyncio.Task | None = None
+
         # Converts EngineCoreOutputs --> RequestOutput.
         self.output_processor = OutputProcessor(
             renderer.tokenizer,
@@ -159,6 +174,7 @@ class AsyncLLM(EngineClient):
             stream_interval=self.vllm_config.scheduler_config.stream_interval,
             tracing_enabled=tracing_endpoint is not None,
             admission_stats=self.admission_stats,
+            lwd_pd_results=self._lwd_pd_results,
         )
 
         # EngineCore (starts the engine in background process).
@@ -175,6 +191,10 @@ class AsyncLLM(EngineClient):
             client_index=client_index,
             renderer=renderer,
         )
+        if self._lwd_pd_results is not None:
+            self._lwd_pd_handoff = LwdFrontendResultHandoff(
+                self._lwd_pd_results, self.engine_core.call_utility_async, logger
+            )
 
         # Loggers.
         self.logger_manager: StatLoggerManager | None = None
@@ -287,6 +307,8 @@ class AsyncLLM(EngineClient):
         handler = getattr(self, "output_handler", None)
         if handler is not None:
             cancel_task_threadsafe(handler)
+        if result_task := getattr(self, "_lwd_pd_result_task", None):
+            cancel_task_threadsafe(result_task)
 
     def get_num_unfinished_requests(self) -> int:
         return self.output_processor.get_num_unfinished_requests()
@@ -517,11 +539,30 @@ class AsyncLLM(EngineClient):
         ):
             self.check_admission(request_id=request.request_id)
 
+        if (
+            getattr(self, "_lwd_pd_results", None) is not None
+            and request.sampling_params is not None
+            and not self.output_processor.has_request(request.request_id)
+        ):
+            request.sampling_params = request.sampling_params.clone()
+            request.sampling_params.extra_args = {
+                **(request.sampling_params.extra_args or {}),
+                "lwd_pd_attempt_id": uuid4().hex,
+            }
+
         # Register locally before the first await so concurrent tasks see this request.
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+        try:
+            await self.engine_core.add_request_async(request)
+        except Exception:
+            if handoff := getattr(self, "_lwd_pd_handoff", None):
+                self.output_processor.abort_requests(
+                    [request.request_id], internal=True, frontend_reason="error"
+                )
+                await handoff.flush({request.request_id})
+            raise
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
@@ -717,19 +758,25 @@ class AsyncLLM(EngineClient):
         # we abort the request if we end up here.
         except (asyncio.CancelledError, GeneratorExit):
             if q is not None:
-                await self.abort(q.request_id, internal=True)
+                await self.abort(
+                    q.request_id, internal=True, frontend_reason="disconnected"
+                )
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
             raise
 
         # Engine is dead. Do not abort since we shut down.
         except EngineDeadError:
+            if q is not None and getattr(self, "_lwd_pd_handoff", None) is not None:
+                await self.abort(q.request_id, internal=True, frontend_reason="error")
             if self.log_requests:
                 logger.info("Request %s failed (engine dead).", request_id)
             raise
 
         # Request validation error or admission control rejection.
         except (VLLMClientError, GracefulHTTPError) as e:
+            if q is not None and getattr(self, "_lwd_pd_handoff", None) is not None:
+                await self.abort(q.request_id, internal=True, frontend_reason="error")
             if self.log_requests:
                 logger.info("Request %s failed (bad request): %s.", request_id, e)
             raise
@@ -737,7 +784,7 @@ class AsyncLLM(EngineClient):
         # Error from input stream generator - propagate directly.
         except InputStreamError as e:
             if q is not None:
-                await self.abort(q.request_id, internal=True)
+                await self.abort(q.request_id, internal=True, frontend_reason="error")
             if self.log_requests:
                 logger.info("Request %s failed (input error): %s.", request_id, e)
             raise e.cause from e
@@ -745,7 +792,13 @@ class AsyncLLM(EngineClient):
         # Unexpected error in the generate() task (possibly recoverable).
         except Exception as e:
             if q is not None:
-                await self.abort(q.request_id, internal=True)
+                await self.abort(
+                    q.request_id,
+                    internal=True,
+                    frontend_reason="timeout"
+                    if isinstance(e, TimeoutError)
+                    else "error",
+                )
             if self.log_requests:
                 try:
                     s = f"{e.__class__.__name__}: {e}"
@@ -771,6 +824,9 @@ class AsyncLLM(EngineClient):
         # object, or else it won't be garbage collected and cleaned up properly.
         engine_core = self.engine_core
         output_processor = self.output_processor
+        pd_handoff = getattr(self, "_lwd_pd_handoff", None)
+        if pd_handoff is not None and self._lwd_pd_result_task is None:
+            self._lwd_pd_result_task = asyncio.create_task(pd_handoff.run())
         log_stats = self.log_stats
         # We use a mutable list for logger_manager so that it can be updated
         # during elastic EP scaling (see scale_elastic_ep) without creating
@@ -822,6 +878,10 @@ class AsyncLLM(EngineClient):
                             await asyncio.sleep(0)
 
                         # 3) Abort any reqs that finished due to stop strings.
+                        if pd_handoff is not None:
+                            await pd_handoff.flush(
+                                {eco.request_id for eco in outputs_slice}
+                            )
                         if processed_outputs.reqs_to_abort:
                             await engine_core.abort_requests_async(
                                 processed_outputs.reqs_to_abort
@@ -842,18 +902,33 @@ class AsyncLLM(EngineClient):
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
+                if pd_handoff is not None:
+                    await pd_handoff.flush()
 
         self.output_handler = asyncio.create_task(output_handler())
 
     async def abort(
-        self, request_id: str | Iterable[str], internal: bool = False
+        self,
+        request_id: str | Iterable[str],
+        internal: bool = False,
+        *,
+        frontend_reason: LwdFrontendReason = "cancelled",
     ) -> None:
         """Abort RequestId in OutputProcessor and EngineCore."""
 
         request_ids = (
             (request_id,) if isinstance(request_id, str) else as_list(request_id)
         )
-        all_request_ids = self.output_processor.abort_requests(request_ids, internal)
+        handoff = getattr(self, "_lwd_pd_handoff", None)
+        all_request_ids = (
+            self.output_processor.abort_requests(
+                request_ids, internal, frontend_reason=frontend_reason
+            )
+            if handoff is not None
+            else self.output_processor.abort_requests(request_ids, internal)
+        )
+        if handoff is not None:
+            await handoff.flush(set(all_request_ids))
         await self.engine_core.abort_requests_async(all_request_ids)
 
         if self.log_requests:

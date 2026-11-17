@@ -1,0 +1,52 @@
+# All processes read this topology. Set each instance's native model/TP/DP
+# and scheduler options independently in its vllm serve command.
+deployment:
+  mode: 0
+  scene: lwd_cluster
+  edges_num: 1
+  clouds_num: 2
+  data_plane_comm: host
+  data_plane_host:
+    # Shared capacity, not a scheduling token limit; size for the largest
+    # model frame, including expert IDs and any auxiliary payload.
+    up_buffer_size: 256
+    down_buffer_size: 32
+    deployment: in_process
+  pd:
+    enabled: true
+    max_inflight_windows: 4
+    request_ttl_s: 1800.0
+feature_ctrl:
+  enable_early_recv: true
+edges:
+  - id: 0
+    dp:
+      - dp_idx: 0
+        addr: 10.0.0.1
+    coordination:
+      enabled: true
+      control_url: http://10.2.0.1:8200/v1/chat/completions
+      tenant_key_file: /run/secrets/lwd-tenant.key
+      consumer_id: edge-0
+clouds:
+  - id: 0
+    stage_role: prefill
+    dp:
+      - {dp_idx: 0, addr: 10.1.0.1, ctrl_port: 6100, data_port: 7100}
+      - {dp_idx: 1, addr: 10.1.0.1, ctrl_port: 6101, data_port: 7101}
+    coordination:
+      enabled: true
+      listen_port: 8100
+  - id: 1
+    stage_role: decode
+    dp:
+      - {dp_idx: 0, addr: 10.1.0.2, ctrl_port: 6100, data_port: 7100}
+      - {dp_idx: 1, addr: 10.1.0.2, ctrl_port: 6101, data_port: 7101}
+      - {dp_idx: 2, addr: 10.1.0.2, ctrl_port: 6102, data_port: 7102}
+      - {dp_idx: 3, addr: 10.1.0.2, ctrl_port: 6103, data_port: 7103}
+    coordination:
+      enabled: true
+      listen_port: 8100
+instance_links:
+  - {edge: 0, cloud: 0}
+  - {edge: 0, cloud: 1}
