@@ -148,4 +148,4 @@ Each request's host buffer has the analogous full-prompt layout `[prompt embeddi
 | Range, send-watermark, and abort routing | `vllm/v1/lwd_control/control_edge_scheduler/` |
 | Hint/arrival sideband protocol | `vllm_ascend/worker/lwd_cloud_model/lwd_pre_recv.py` |
 | Per-request buffers and tombstones | `vllm_ascend/worker/lwd_cloud_model/lwd_host_stage.py` |
-| Receive/D2H and window/H2D execution | `lwd_cloud_worker.py`, `lwd_cloud_model_runner.py`, and `distributed/lwd_data_plane/lwd_transfer_queue.py` |
+| Receive/D2H and window/H2D execution | `lwd_cloud_worker.py`, `lwd_cloud_model_runner.py`, and vLLM `distributed/lwd/lwd_transfer_queue.py` / Ascend `lwd_hccl_transfer_queue.py` |

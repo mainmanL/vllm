@@ -10,7 +10,7 @@ The data plane spans two repositories:
 | vLLM groups | `_lwd_initialize_model_parallel` in `vllm/distributed/parallel_state.py` | TP/PP/DCP/PCP/DP/EP groups of the shared world |
 | Ascend groups | `vllm_ascend/distributed/lwd_data_plane/lwd_parallel_groups.py`, called from `init_ascend_model_parallel` | MC2 and dynamic EPLB groups |
 | Channels | `vllm_ascend/distributed/lwd_data_plane/lwd_channels.py` | UP/DOWN groups, streams and warmup per DP connection |
-| Transfers | `vllm_ascend/distributed/lwd_data_plane/{lwd_data_plane,lwd_transfer_queue,lwd_transfer_future,lwd_types}.py` | `LwdDataPlane`: async send/recv submission; `LwdTransferQueue`: per-channel seqno FIFO; `LwdTransferFuture`: completion futures |
+| Transfers | `vllm/distributed/lwd/{lwd_data_plane,lwd_transfer_queue,lwd_transfer_future,lwd_types}.py`（公共协议与 FIFO）；`vllm_ascend/distributed/lwd_data_plane/lwd_hccl_transfer_queue.py`（HCCL 执行） | `LwdDataPlane`: async send/recv submission; `LwdBaseTransferQueue`: per-channel seqno FIFO; `LwdTransferFuture`: completion futures |
 | Payload scramble | `vllm_ascend/distributed/lwd_data_plane/lwd_payload_scrambler.py` | `LwdPayloadScrambler`: obfuscating the hidden states on the wire |
 
 ## Communication domains
