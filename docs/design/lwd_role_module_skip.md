@@ -10,8 +10,8 @@ LWD 使用 rank-replay：云侧发送 post-norm hidden states 和 `top_id_ths`�
 
 - 不调用 `make_layers`，不创建 decoder、`PPMissingLayer`、final norm、`hc_head`、MTP、KV cache 或 MoE 占位；
 - `LwdEdgeModelLoader` 按架构选择专用 builder；未登记的架构在加载前 fail-fast；
-- 当前首批 builder 为 DeepSeek V4/V4.1 文本路径，只创建 `embed_tokens`、`lm_head` 和 `LogitsProcessor`；
-- 多模态 builder 尚未开放，不能回退到完整模型加载；
+- 当前 builder 覆盖 DeepSeek V4/V4.1 文本路径和 Qwen3.5 多模态路径；前者只创建 `embed_tokens`、`lm_head` 和 `LogitsProcessor`，后者复用原生视觉塔与多模态合并方法；
+- 其他模型尚未提供专用 builder，不能回退到完整模型加载；
 - GPU 与 NPU 边侧复用同一 `LwdEdgeGPUModelRunner` 业务流程，NPU 只保留设备初始化与观测适配。
 
 `make_layers` 中按 `lwd_config.role == "edge"` 强制 `start_layer = end_layer = 0` 的历史分支已删除。该函数只负责原生 PP 层段构建，不再承担 LWD 角色判断。

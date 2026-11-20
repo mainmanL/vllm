@@ -14,11 +14,13 @@ from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 
 from .deepseek_v4 import build_deepseek_v4_edge_model, build_deepseek_v41_edge_model
+from .qwen3_5 import build_qwen35_edge_model
 
 LwdEdgeBuilder = Callable[[VllmConfig], torch.nn.Module]
 _BUILDERS: dict[str, LwdEdgeBuilder] = {
     "DeepseekV4ForCausalLM": build_deepseek_v4_edge_model,
     "DeepseekV41ForCausalLM": build_deepseek_v41_edge_model,
+    "Qwen3_5ForConditionalGeneration": build_qwen35_edge_model,
 }
 
 

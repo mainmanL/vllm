@@ -148,7 +148,7 @@ LwdBaseModelRunner
 承载现有 NPU 边侧 runner 的公共业务：
 
 - `load_model` 后的边侧初始化和 UP layout 构建；
-- EMBED：注册请求状态、H2D token ids、文本 embedding、Hash MoE 查表、Engram 哈希、UP pack/send；多模态编码与合并仅在提供专用 builder 后开放；
+- EMBED：注册请求状态、H2D token ids、文本 embedding、Hash MoE 查表、Engram 哈希、UP pack/send；Qwen3.5 通过原生视觉塔与多模态合并路径处理图像输入，其他未登记模型 fail-fast；
 - UNEMBED：提交 DOWN receive、等待设备事件、`compute_logits`、稳定排序、按 `top_id_ths` 恢复 token；
 - 每连接 UP send future 队列和连续成功 watermark；
 - `finished_req_ids` 对应的 MM feature 与 Engram prompt 清理；
@@ -200,7 +200,7 @@ LwdEdgeModel（nn.Module）
 └── load_weights(...)
 ```
 
-- 按 `model_config.architecture` 选择 edge builder；未登记的模型族 fail-fast。当前只登记 DeepSeek V4/V4.1 文本路径。
+- 按 `model_config.architecture` 选择 edge builder；未登记的模型族 fail-fast。当前登记 DeepSeek V4/V4.1 文本路径和 Qwen3.5 多模态路径。
 - 复用原生 `VocabParallelEmbedding`、`ParallelLMHead`、量化配置和 `hf_to_vllm_mapper`，不实例化完整模型；`lm_head` 保持原生未量化构建方式。
 - 模块命名保持与原生权重映射兼容，`AutoWeightsLoader`、现有 `hf_to_vllm_mapper` 和量化配置继续工作。
 - 使用 `LwdEdgeModelLoader(BaseModelLoader)`：仅将 `create_model` 替换为 edge builder；`download_model`、`load_weights` 和 post-load 处理委托给现有 loader，保留 Default/Dummy 等加载路径及量化后处理。
@@ -410,7 +410,7 @@ NPU HCCL 的 group/channel 创建留在 vllm-ascend；公共 FIFO 只抽取与�
 
 ## 15. 本期范围基线
 
-- 仅支持 GPU Model Runner V1、host `in_process`、边侧单卡、BF16 UP payload；首批模型 builder 仅开放 DeepSeek V4/V4.1 文本路径。
+- 仅支持 GPU Model Runner V1、host `in_process`、边侧单卡、BF16 UP payload；当前开放 DeepSeek V4/V4.1 文本路径与 Qwen3.5 多模态路径。
 - GPU edge 必须使用 host UCX；NPU edge 继续支持 HCCL 和 UCX。
 - 云侧只复用公共代码，不迁移云侧主体。
 - 模型按 edge builder 和真机 rank-replay 验收逐个开放。
