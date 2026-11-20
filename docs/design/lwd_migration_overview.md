@@ -26,7 +26,7 @@
 
 **已具备 (零改动)**:
 
-- `vllm/model_executor/models/utils.py::make_layers` 已有 LWD 分支: `lwd_config.role == "edge"` 时 `start_layer = end_layer = 0`, 边侧全部层为 `PPMissingLayer` — 等价老代码 `(0,0)` 切分 (embed + lm_head only).
+- `vllm/model_executor/models/utils.py::make_layers` 只负责原生 PP 层段，不再保留 edge 强制零层分支。边侧由 `vllm/model_executor/models/lwd/` 的专用 builder 直接创建 embed + lm_head，不构建完整模型或 `PPMissingLayer`，详见 [lwd_gpu_edge_upstream.md](lwd_gpu_edge_upstream.md).
 - pp=1 集中式运行, 建组由 `vllm/distributed/lwd/` 从拓扑推导 (`lwd_check_parallel_config`).
 - 控制面 `vllm/v1/lwd_control/lwd_comm/` (ROUTER/DEALER), 请求逐字段过 wire (`LWD_SAMPLING_FIELDS`).
 - rank-replay 数据面全链路 (`LwdC2eMeta`, `top_id_ths`, 回放), 批型 `LwdBatchType/LwdEmbedBatch/LwdUnembedBatch`.

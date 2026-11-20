@@ -31,12 +31,9 @@ Rules (mirror discipline, ``docs/design/lwd_weight_split.md``):
   vllm-ascend reads it directly from the shard files by path, so the edge
   slice must keep it even though the load-time filter would drop it.
 * ``hc_head_{fn,base,scale}`` (DeepSeek-V4's hyper-connection head) is a
-  both-roles-keep tensor-level special case: the three tensors are FLAT
-  parameters on the model (no dot boundary), so no ownership-table row --
-  whose matching is all on dot boundaries -- can cover them, and the
-  load-time filter never skips them either. Both roles construct the
-  parameters (there is no module to prune at build time), so both slices
-  keep them; only the cloud actually runs the kernel.
+  cloud-only tensor-level special case: the dedicated edge model does not
+  construct these parameters, while the cloud trunk uses them before its
+  final norm.
 * The source shard ``__metadata__`` (e.g. ``{"format": "pt"}``) is
   preserved in the output shards, keeping the split directories loadable
   by stock HF tooling and not only vLLM.
@@ -186,15 +183,10 @@ _EDGE_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:model\.)?layers\.\d+\.(?:ffn|mlp)\.gate\.tid2eid(?:\.weight)?$"),
 )
 
-# Tensor-level special case for BOTH roles: DeepSeek-V4's hyper-connection
-# head collapses the hc multi-stream residual at the top of the trunk
-# forward, right before the final norm. Its three tensors are FLAT
-# parameters on the model (``hc_head_{fn,base,scale}``, no dot boundary),
-# so no ownership-table row can express them and the load-time filter never
-# skips them. Both roles construct the parameters (there is no module to
-# prune at build time), so both slices keep them; only the cloud runs the
-# kernel.
-_BOTH_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
+# Tensor-level special case for CLOUD: DeepSeek-V4's hyper-connection head
+# collapses the hc multi-stream residual at the top of the trunk forward.
+# The dedicated edge model never constructs these parameters.
+_CLOUD_KEEP_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:model\.)?hc_head_(?:fn|base|scale)(?:\.weight)?$"),
 )
 
@@ -325,12 +317,13 @@ def classify_all(
             keep.add(name)
             _attribute(f"cli-regex:{matched_regex.pattern}", name)
             continue
-        # Tensor-level special case for BOTH roles: DeepSeek-V4's flat
-        # hyper-connection head parameters (no dot boundary -- no ownership
-        # row can match them; the load-time filter keeps them for both
-        # roles too).
-        if any(p.match(_unwrap_vl_text_prefix(name)) for p in _BOTH_KEEP_PATTERNS):
-            keep.add(name)
+        # Cloud-only tensor-level special case: DeepSeek-V4's hyper-connection
+        # head is used only by the full cloud trunk.
+        if any(p.match(_unwrap_vl_text_prefix(name)) for p in _CLOUD_KEEP_PATTERNS):
+            if role == "cloud":
+                keep.add(name)
+            else:
+                drop.add(name)
             _attribute("special:hc_head", name)
             continue
         if role == "edge" and any(p.match(name) for p in _EDGE_KEEP_PATTERNS):
@@ -1089,9 +1082,9 @@ def _print_rule_report(
         print(
             "[rule] edge tensor special-case keeps: tid2eid (Hash MoE routing tables)"
         )
-    if _BOTH_KEEP_PATTERNS:
+    if _CLOUD_KEEP_PATTERNS:
         print(
-            "[rule] both-role tensor special-case keeps: "
+            "[rule] cloud-only tensor special-case keeps: "
             "hc_head (DeepSeek-V4 hyper-connection head)"
         )
     total = len(keep) + len(drop) + len(uncovered)

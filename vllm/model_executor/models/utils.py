@@ -936,7 +936,6 @@ def make_layers(
     Returns:
         Tuple of (start_layer, end_layer, modules).
     """
-    from vllm.config import get_current_vllm_config_or_none
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
     from vllm.model_executor.offloader import get_offloader
@@ -944,14 +943,6 @@ def make_layers(
     start_layer, end_layer = get_pp_indices(
         num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
     )
-
-    # LWD edge: the edge process holds embeddings + lm_head only (embed +
-    # unembed compute); zero decoder layers by design. Cloud and non-LWD
-    # processes keep the stock PP indices untouched.
-    vllm_config = get_current_vllm_config_or_none()
-    lwd_config = getattr(vllm_config, "lwd_config", None)
-    if lwd_config is not None and lwd_config.role == "edge":
-        start_layer = end_layer = 0
 
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]

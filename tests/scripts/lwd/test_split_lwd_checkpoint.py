@@ -29,6 +29,7 @@ import json
 import os
 import struct
 import sys
+import threading
 import types
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -57,6 +58,41 @@ def _load_script():
 
 
 script = _load_script()
+
+
+@pytest.fixture(autouse=True)
+def _windows_pwrite(monkeypatch: pytest.MonkeyPatch):
+    if hasattr(os, "pwrite"):
+        yield
+        return
+    lock = threading.Lock()
+
+    def pwrite(fd: int, data: bytes, offset: int) -> int:
+        with lock:
+            previous = os.lseek(fd, 0, os.SEEK_CUR)
+            try:
+                os.lseek(fd, offset, os.SEEK_SET)
+                return os.write(fd, data)
+            finally:
+                os.lseek(fd, previous, os.SEEK_SET)
+
+    def pread(fd: int, count: int, offset: int) -> bytes:
+        with lock:
+            previous = os.lseek(fd, 0, os.SEEK_CUR)
+            try:
+                os.lseek(fd, offset, os.SEEK_SET)
+                return os.read(fd, count)
+            finally:
+                os.lseek(fd, previous, os.SEEK_SET)
+
+    def copy_file_range(*args, **kwargs) -> int:
+        raise OSError("copy_file_range is unavailable on Windows")
+
+    monkeypatch.setattr(os, "pwrite", pwrite, raising=False)
+    monkeypatch.setattr(os, "pread", pread, raising=False)
+    monkeypatch.setattr(os, "copy_file_range", copy_file_range, raising=False)
+    yield
+
 
 # ---------------------------------------------------------------------------
 # Synthetic checkpoints (stdlib-only safetensors writer / reader)
@@ -113,10 +149,10 @@ EXPECTED_OWNERSHIP: dict[str, frozenset[str]] = {
     "rot.weight": CLOUD_ONLY,
     "model.visual.blk.0.attn_qkv.weight": EDGE_ONLY,
     "model.visual.merger.norm.weight": EDGE_ONLY,
-    # DeepSeek-V4 flat hyper-connection head: both-roles special case
-    "hc_head_fn": BOTH,
-    "hc_head_base": BOTH,
-    "hc_head_scale": BOTH,
+    # DeepSeek-V4 flat hyper-connection head: cloud-only
+    "hc_head_fn": CLOUD_ONLY,
+    "hc_head_base": CLOUD_ONLY,
+    "hc_head_scale": CLOUD_ONLY,
 }
 
 # Native DeepSeek layout: no leading ``model.``, ``head`` / ``embed`` renames.
@@ -131,10 +167,10 @@ NATIVE_OWNERSHIP: dict[str, frozenset[str]] = {
     # QuaRot top-level draft input rotation: native layouts export it flat
     # too (the shape real GLM/DeepSeek w8a8c8 checkpoints ship).
     "rot.weight": CLOUD_ONLY,
-    # DeepSeek-V4 flat hyper-connection head: both-roles special case
-    "hc_head_fn": BOTH,
-    "hc_head_base": BOTH,
-    "hc_head_scale": BOTH,
+    # DeepSeek-V4 flat hyper-connection head: cloud-only
+    "hc_head_fn": CLOUD_ONLY,
+    "hc_head_base": CLOUD_ONLY,
+    "hc_head_scale": CLOUD_ONLY,
 }
 
 EDGE_METADATA_FILES = {
@@ -650,16 +686,8 @@ def test_uncovered_tensor_fails_fast(tmp_path: Path, capsys) -> None:
     )
 
 
-@pytest.mark.parametrize("role", ["edge", "cloud"])
-def test_deepseek_v4_hc_head_kept_for_both_roles(
-    role: str, tmp_path: Path, capsys
-) -> None:
-    """Regression: DeepSeek-V4-Flash ships ``hc_head_{fn,base,scale}`` as FLAT
-    parameters (no dot boundary), so no ownership row can match them and the
-    coverage check failed with exit code 3. They must classify without CLI
-    flags: both roles keep them (the load-time filter skips them for neither
-    and both roles construct the parameters; only the cloud runs the kernel).
-    """
+def test_deepseek_v4_hc_head_is_cloud_only(tmp_path: Path, capsys) -> None:
+    """The dedicated edge model never constructs hc_head parameters."""
     src = tmp_path / "src"
     src.mkdir()
     _write_checkpoint(
@@ -675,19 +703,23 @@ def test_deepseek_v4_hc_head_kept_for_both_roles(
         },
     )
 
-    # dry-run classifies everything without CLI flags
-    rc = script.main(["--src", str(src), "--role", role, "--dry-run", "--no-progress"])
-    assert rc == 0
-    captured = capsys.readouterr()
-    assert "[plan] special:hc_head: 3 tensors" in captured.out
-    assert "matched no rule" not in captured.out
+    for role in ("edge", "cloud"):
+        rc = script.main(
+            ["--src", str(src), "--role", role, "--dry-run", "--no-progress"]
+        )
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert "[plan] special:hc_head: 3 tensors" in captured.out
+        assert "matched no rule" not in captured.out
 
-    # a real split keeps the three tensors in the role's output
-    dst = tmp_path / "out"
-    assert _split(src, dst, role) == 0
-    tensors, _ = _output_tensors(dst)
-    assert {"hc_head_fn", "hc_head_base", "hc_head_scale"} <= set(tensors)
-    assert tensors["hc_head_fn"] == _payload("hc_head_fn")
+        dst = tmp_path / role
+        assert _split(src, dst, role) == 0
+        tensors, _ = _output_tensors(dst)
+        if role == "cloud":
+            assert {"hc_head_fn", "hc_head_base", "hc_head_scale"} <= set(tensors)
+            assert tensors["hc_head_fn"] == _payload("hc_head_fn")
+        else:
+            assert not {"hc_head_fn", "hc_head_base", "hc_head_scale"} & set(tensors)
 
 
 def test_usage_errors(tmp_path: Path) -> None:
@@ -822,6 +854,7 @@ def test_no_index_fallback_skips_companion_tensors(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.skipif(os.name == "nt", reason="ProcessPoolExecutor requires POSIX pwrite")
 def test_parallel_writer_matches_serial(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()

@@ -47,15 +47,15 @@ flowchart LR
 | --- | --- | --- | --- |
 | `embed` / `embed_tokens` | 保留 | 保留 | 边嵌入入口; 云 decode 嵌新 token |
 | `lm_head` | 保留 | 保留 | **rank-replay 前提**: 边 unembed 回放、云采样+秩编码各需一份 |
-| `layers.*` | 丢弃 | 保留 | 与 `make_layers` LWD 分支镜像 |
+| `layers.*` | 丢弃 | 保留 | 专用 edge builder 不创建 decoder，不使用零层适配 |
 | `norm.*` | 丢弃 | 保留 | D2 定案: 边裁 norm (云 forward 末 norm, 下行 hidden 已 post-norm); 证据链见 F1 §3.5 |
 | `visual.*` | 保留 | 丢弃 | D3 定案: 多模态编码只在边 (F1 归属表 `visual → edge`) |
 | `mtp.*` / draft | 丢弃 | 保留 | drafter 在云 |
 | `tid2eid` | 保留 (正则特例) | layers 规则覆盖 | 边虽不建层, vllm-ascend 按路径直接读 (Hash MoE 路由表) |
-| `hc_head_{fn,base,scale}` | 保留 (正则特例) | 保留 (正则特例) | DeepSeek-V4 hyper-connection 头: 模型上的**扁平参数** (无点边界, 归属表无法表达; 加载过滤器两侧均不跳过), 两侧都构造参数, 双侧各留一份; 仅云在 trunk forward 末尾真正执行 kernel |
+| `hc_head_{fn,base,scale}` | 丢弃 | 保留 (正则特例) | DeepSeek-V4 hyper-connection 头为 **cloud-only**：仅云模型在 trunk forward 末尾执行；边侧专用模型不创建，edge checkpoint 不保留 |
 | 其余 | **报错** | **报错** | fail-fast: 规则未覆盖的张量必须显式归类后才能放行 |
 
-**镜像纪律 (方案 A 定案)**: ROLE_RULES 不再手抄——由 F1 的 `LWD_MODULE_OWNERSHIP` 表 (PR1 落 `models/utils.py`) 推导: 表内每行 (后缀, 归属集) 展开为两侧的张量名规则, 加上张量级特例 `tid2eid` (edge 保留) 与 `hc_head_{fn,base,scale}` (双角色保留) (正则, 张量名≠模块点路径, 特例显式登记). 脚本 `import vllm.model_executor.models.utils` 拿到同一对象 (允许脚本依赖 vllm 包; 无 vllm 环境的离线主机可退回 vendored 副本, 但单测断言两份等价, 禁止静默漂移).
+**镜像纪律 (方案 A 定案)**: ROLE_RULES 不再手抄——由 F1 的 `LWD_MODULE_OWNERSHIP` 表 (PR1 落 `models/utils.py`) 推导: 表内每行 (后缀, 归属集) 展开为两侧的张量名规则, 加上张量级特例 `tid2eid` (edge 保留) 与 `hc_head_{fn,base,scale}` (**cloud-only**) (正则, 张量名≠模块点路径, 特例显式登记). 脚本 `import vllm.model_executor.models.utils` 拿到同一对象 (允许脚本依赖 vllm 包; 无 vllm 环境的离线主机可退回 vendored 副本, 但单测断言两份等价, 禁止静默漂移).
 
 ## 5. METADATA_RULES
 
@@ -73,7 +73,7 @@ flowchart LR
 
 ```text
 topology (gen_lwd_topology.py)          checkpoint 切片 (split_lwd_checkpoint.py)
-  edge 实例  ──────────────────────────  edge_dir   (embed+lm_head+visual+tid2eid+hc_head)
+  edge 实例  ──────────────────────────  edge_dir   (embed+lm_head+visual+tid2eid)
   cloud 实例 ──────────────────────────  cloud_dir  (layers+norm+mtp+lm_head+tokenizer+hc_head)
 ```
 

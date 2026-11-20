@@ -9,6 +9,7 @@ cloud norm hidden states before sending them DOWN), the cloud skips the
 vision tower (multimodal processing lives on the edge).
 """
 
+import inspect
 from types import SimpleNamespace
 from typing import Any
 
@@ -95,7 +96,8 @@ def _param_names(model: torch.nn.Module) -> set[str]:
         ("model.embed_tokens", "cloud", False),
         ("lm_head", "edge", False),
         ("lm_head", "cloud", False),
-        # Transformer layers live on the cloud (edge builds zero layers).
+        # Ownership row used by load filtering and offline splitting. The
+        # dedicated edge builder creates no layers and never calls make_layers.
         ("model.layers", "edge", True),
         ("model.layers", "cloud", False),
         # The MTP drafter lives on the cloud.
@@ -124,6 +126,12 @@ def test_lwd_module_ownership_entries_are_explicit() -> None:
 def test_lwd_role_is_none_without_lwd_config() -> None:
     with set_current_vllm_config(VllmConfig()):
         assert lwd_role() is None
+
+
+def test_make_layers_has_no_zero_layer_lwd_branch() -> None:
+    from vllm.model_executor.models.utils import make_layers
+
+    assert "lwd_config" not in inspect.getsource(make_layers)
 
 
 @pytest.mark.parametrize("role", ["edge", "cloud"])
@@ -266,22 +274,17 @@ def _make_deepseek_v2_config() -> DeepseekV2Config:
     )
 
 
-@pytest.mark.parametrize("role", ["edge", "cloud", None])
+@pytest.mark.parametrize("role", ["cloud", None])
 def test_deepseek_v2_norm_guard(role: str | None, dist_init: None) -> None:
-    """Edge builds no final norm; cloud and non-LWD keep it."""
+    """Full models keep native layers; dedicated edge models do not use this path."""
     model = _build_model(DeepseekV2Model, _make_deepseek_v2_config(), role)
     names = _param_names(model)
     norm_params = [n for n in names if ".norm." in n]
     layer_params = [n for n in names if ".layers." in n]
     embed_params = [n for n in names if ".embed_tokens." in n]
-    if role == "edge":
-        assert isinstance(model.norm, PPMissingLayer)
-        assert not norm_params
-        assert not layer_params
-    else:
-        assert not isinstance(model.norm, PPMissingLayer)
-        assert norm_params
-        assert layer_params
+    assert not isinstance(model.norm, PPMissingLayer)
+    assert norm_params
+    assert layer_params
     assert embed_params
 
 
@@ -305,22 +308,17 @@ def _make_qwen3_5_config() -> Qwen3_5MoeTextConfig:
     )
 
 
-@pytest.mark.parametrize("role", ["edge", "cloud", None])
+@pytest.mark.parametrize("role", ["cloud", None])
 def test_qwen3_5_norm_guard(role: str | None, dist_init: None) -> None:
-    """Edge builds no final norm; cloud and non-LWD keep it."""
+    """Full models keep native layers; dedicated edge models do not use this path."""
     model = _build_model(Qwen3_5Model, _make_qwen3_5_config(), role)
     names = _param_names(model)
     norm_params = [n for n in names if ".norm." in n]
     layer_params = [n for n in names if ".layers." in n]
     embed_params = [n for n in names if ".embed_tokens." in n]
-    if role == "edge":
-        assert isinstance(model.norm, PPMissingLayer)
-        assert not norm_params
-        assert not layer_params
-    else:
-        assert not isinstance(model.norm, PPMissingLayer)
-        assert norm_params
-        assert layer_params
+    assert not isinstance(model.norm, PPMissingLayer)
+    assert norm_params
+    assert layer_params
     assert embed_params
 
 

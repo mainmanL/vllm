@@ -78,6 +78,8 @@ def lwd_should_skip_weight(name: str, role: str | None) -> bool:
     """
     if role is None:
         return False
+    if role != "cloud" and name.startswith("hc_head_"):
+        return True
     name = _unwrap_vl_text_prefix(name)
     for key in parse_skip_keys(role):
         bare = key.rsplit(".", 1)[-1]
