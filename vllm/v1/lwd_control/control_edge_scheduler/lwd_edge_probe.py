@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Asynchronous edge-side placement and cross-edge prefix probes."""
+"""Asynchronous direct-DP placement and prefix probe batches."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from vllm.config.lwd.topology import LwdConnectionId
 from vllm.logger import init_logger
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_cloud_health import (
     LwdCloudHealthTracker,
@@ -22,21 +23,14 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
     LwdProbeRuntime,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
-    compute_processor_fingerprint,
-)
-from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdProbeResult
+from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import compute_processor_fingerprint
+from vllm.v1.lwd_control.lwd_comm.lwd_prefix import PROBE_HEADROOM_S, LwdProbeResult
 
 logger = init_logger(__name__)
 
-_WATCHDOG_HEADROOM_S = 5.0
-
 
 class LwdProbeSubmission(Enum):
-    """Outcome of attempting to start an edge probe."""
-
     SUBMITTED = "submitted"
-    ALREADY_INFLIGHT = "already_inflight"
     UNAVAILABLE = "unavailable"
 
 
@@ -49,64 +43,80 @@ class _MediaIdentity:
 
 
 @dataclass(frozen=True)
+class LwdProbeCandidate:
+    connection_id: LwdConnectionId
+    result: LwdProbeResult
+    chain: list[bytes] | None
+
+    def normalized_hit_tokens(self, num_prompt_tokens: int) -> int:
+        hit = min(max(self.result.hit_tokens, 0), max(num_prompt_tokens - 1, 0))
+        alignment = self.result.alignment_tokens
+        return hit - hit % alignment if alignment > 0 else hit
+
+
+@dataclass(frozen=True)
 class LwdProbeCompletion:
     request: Any
-    result: LwdProbeResult | None
-    chain: list[bytes] | None
-    target_cloud: int | None
-    build_block_size: int
-
-    @property
-    def cloud_id(self) -> int:
-        if self.target_cloud is not None:
-            return self.target_cloud
-        if self.result is not None and self.result.cloud_id is not None:
-            return self.result.cloud_id
-        return 0
-
-    @property
-    def engine_index(self) -> int | None:
-        return getattr(self.result, "engine_index", None)
+    probe_nonce: int = 0
+    candidates: tuple[LwdProbeCandidate, ...] = ()
+    failed_targets: tuple[LwdConnectionId, ...] = ()
+    connection_id: LwdConnectionId | None = None
+    result: LwdProbeResult | None = None
+    chain: list[bytes] | None = None
+    activated: bool = False
+    activation_error: str | None = None
 
 
 @dataclass
 class _InflightProbe:
     request: Any
     nonce: int
+    edge_id: int
     media_items: tuple[_MediaIdentity, ...]
+    future: Any = None
+    connection_id: LwdConnectionId | None = None
+    candidate: LwdProbeCandidate | None = None
+    drain_task: Any = None
+    cancelled: bool = False
 
 
 class LwdEdgeProbeManager:
-    """Run HTTP probes off-thread and apply results on the engine thread."""
+    """Run fanout probes off-thread and apply selections on the engine thread."""
 
     def __init__(self, vllm_config: Any, wakeup: Callable[[], None]) -> None:
         self._vllm_config = vllm_config
         self._wakeup = wakeup
         self._runtime: LwdProbeRuntime | None = None
-        self._done: queue.Queue[tuple[str, int, int, Any, int | None]] = queue.Queue()
+        self._done: queue.Queue[tuple[str, int, str, Any]] = queue.Queue()
         self._inflight: dict[str, _InflightProbe] = {}
         self._nonce = 0
-        self._clients: dict[tuple[int, int], LwdEdgePrefixClient] = {}
-        self._hash_sizes: dict[int, int] = {}
+        self._clients: dict[tuple[int, int, int], LwdEdgePrefixClient] = {}
+        self._hash_sizes: dict[tuple[int, int], int] = {}
         self._processor_fingerprint: bytes | None = None
         self._tenant_key: bytes | None = None
-        lwd_config = vllm_config.lwd_config
-        coordination = lwd_config.coordination
-        cloud_ids = tuple(coordination.control_url_map) if coordination else ()
-        self._health = LwdCloudHealthTracker(cloud_ids)
+        self._targets: dict[LwdConnectionId, str] = {}
+        for connection in vllm_config.lwd_config.connections:
+            connection_id = connection.connection_id
+            cloud = connection.cloud
+            url = cloud.coord_url or f"http://{cloud.addr}:{cloud.coord_port}"
+            self._targets[connection_id] = url.rstrip("/")
+        self._health = LwdCloudHealthTracker(
+            tuple((target.cloud_id, target.dp_idx) for target in self._targets)
+        )
 
     @property
     def enabled(self) -> bool:
         coordination = self._vllm_config.lwd_config.coordination
-        return bool(
-            coordination
-            and coordination.enabled
-            and (coordination.control_url or coordination.control_url_map)
-        )
+        return bool(coordination and coordination.enabled and self._targets)
 
     @property
     def pending(self) -> bool:
         return bool(self._inflight) or not self._done.empty()
+
+    def _edge_id(self, request: Any) -> int:
+        if self._vllm_config.lwd_config.topology.deployment.scene == "edge_share":
+            return request.client_index
+        return self._vllm_config.lwd_config.instance_id
 
     def _fingerprint(self) -> bytes:
         if self._processor_fingerprint is None:
@@ -125,24 +135,23 @@ class LwdEdgeProbeManager:
                 self._tenant_key = b""
         return self._tenant_key
 
-    def _client(self, cloud_id: int, block_size: int, url: str) -> LwdEdgePrefixClient:
-        key = (cloud_id, block_size)
+    def _client(self, target: LwdConnectionId, block_size: int) -> LwdEdgePrefixClient:
+        key = (target.cloud_id, target.dp_idx, block_size)
         client = self._clients.get(key)
         if client is not None:
             return client
         coordination = self._vllm_config.lwd_config.coordination
         client = LwdEdgePrefixClient(
-            url,
+            self._targets[target],
             block_size,
             self._key(),
-            edge_id=self._vllm_config.lwd_config.instance_id,
             consumer_id=coordination.consumer_id,
             connect_timeout=coordination.connect_timeout,
             processor_fingerprint=self._fingerprint(),
             probe_timeout=coordination.probe_timeout,
         )
         for stale in tuple(self._clients):
-            if stale[0] == cloud_id and stale != key:
+            if stale[:2] == key[:2] and stale != key:
                 del self._clients[stale]
         self._clients[key] = client
         return client
@@ -160,158 +169,272 @@ class LwdEdgeProbeManager:
             if feature.modality == "image"
         )
 
+    def _visible_targets(self, edge_id: int) -> tuple[LwdConnectionId, ...]:
+        return tuple(target for target in self._targets if target.edge_id == edge_id)
+
+    def _uses_prefix_hit(self, request: Any) -> bool:
+        coordination = self._vllm_config.lwd_config.coordination
+        return bool(
+            self._vllm_config.cache_config.enable_prefix_caching
+            and not coordination.placement_only
+            and not request.skip_reading_prefix_cache
+        )
+
+    def _selected_targets(
+        self, request: Any, edge_id: int
+    ) -> tuple[LwdConnectionId, ...]:
+        visible = self._visible_targets(edge_id)
+        allowed = {(target.cloud_id, target.dp_idx): target for target in visible}
+        healthy = self._health.candidates()
+        targets = tuple(allowed[key] for key in healthy if key in allowed)
+        if self._uses_prefix_hit(request):
+            return targets
+        if not targets:
+            return ()
+        healthy_ids = {(target.cloud_id, target.dp_idx) for target in targets}
+        selected = self._health.next(allowed=healthy_ids)
+        if selected is None:
+            return ()
+        return (allowed[selected],)
+
     def submit(self, request: Any) -> LwdProbeSubmission:
         if request.request_id in self._inflight:
-            return LwdProbeSubmission.ALREADY_INFLIGHT
+            self.abort(request.request_id)
         if not self.enabled:
             return LwdProbeSubmission.UNAVAILABLE
-        coordination = self._vllm_config.lwd_config.coordination
-        target_cloud = self._health.next() if coordination.control_url_map else None
-        if target_cloud is None:
-            url = coordination.control_url
-            cloud_id = 0
-        else:
-            url = coordination.control_url_map[target_cloud]
-            cloud_id = target_cloud
-        if url is None:
+        edge_id = self._edge_id(request)
+        targets = self._selected_targets(request, edge_id)
+        if not targets:
             return LwdProbeSubmission.UNAVAILABLE
-        block_size = self._hash_sizes.get(
-            cloud_id, self._vllm_config.cache_config.block_size
-        )
-        client = self._client(cloud_id, block_size, url)
-        request_id = request.request_id
-        prompt_ids = list(request.prompt_token_ids)
-        media_items = self._media_items(request)
-        model_config = self._vllm_config.model_config
-        model_name = model_config.served_model_name or model_config.model
-        placement_only = coordination.placement_only
-        manifest_chain: list[bytes] | None = None
         if self._runtime is None:
             self._runtime = LwdProbeRuntime()
         runtime = self._runtime
-
-        async def job() -> Any:
-            nonlocal manifest_chain
-            session = await runtime.ensure_session()
-            manifest = client.build_manifest(
-                request_id, prompt_ids, media_items=media_items
-            )
-            manifest_chain = (
-                None if placement_only else list(manifest.full_block_hashes)
-            )
-            result = await client.negotiate(
-                session,
-                request_id,
-                prompt_ids,
-                manifest=manifest,
-                media_items=media_items,
-                model=model_name,
-            )
-            return result, manifest_chain
-
-        try:
-            future = runtime.submit(job())
-        except Exception:
-            logger.warning(
-                "[LWD] probe submission failed; using full prefill", exc_info=True
-            )
-            runtime.stop()
-            self._runtime = None
-            return LwdProbeSubmission.UNAVAILABLE
+        coordination = self._vllm_config.lwd_config.coordination
         self._nonce += 1
         nonce = self._nonce
-        self._inflight[request_id] = _InflightProbe(request, nonce, media_items)
+        media_items = self._media_items(request)
+        inflight = _InflightProbe(request, nonce, edge_id, media_items)
+        self._inflight[request.request_id] = inflight
+        placement_only = not self._uses_prefix_hit(request)
 
-        def enqueue(outcome: Any) -> None:
-            self._done.put((request_id, nonce, block_size, outcome, target_cloud))
+        async def one(target: LwdConnectionId) -> Any:
+            session = await runtime.ensure_session()
+            block_size = self._hash_sizes.get(
+                (target.cloud_id, target.dp_idx),
+                self._vllm_config.cache_config.block_size,
+            )
+            client = self._client(target, block_size)
+            manifest = client.build_manifest(
+                request.request_id,
+                list(request.prompt_token_ids),
+                media_items=media_items,
+            )
+            try:
+                result = await client.probe(
+                    session,
+                    request.request_id,
+                    list(request.prompt_token_ids),
+                    edge_id=edge_id,
+                    cloud_id=target.cloud_id,
+                    dp_idx=target.dp_idx,
+                    probe_nonce=nonce,
+                    manifest=manifest,
+                    media_items=media_items,
+                    model=self._model_name(),
+                )
+                chain = None if placement_only else list(manifest.full_block_hashes)
+                return target, result, chain, block_size, None
+            except Exception as exc:  # noqa: BLE001
+                return target, None, None, block_size, exc
+
+        batch_coroutines = [one(target) for target in targets]
+        try:
+            future = runtime.submit_group(batch_coroutines)
+        except Exception:
+            for coroutine in batch_coroutines:
+                coroutine.close()
+            self._inflight.pop(request.request_id, None)
+            logger.exception("[LWD] failed to submit DP probe batch")
+            return LwdProbeSubmission.UNAVAILABLE
+        inflight.future = future
+
+        def enqueue(kind: str, outcome: Any) -> None:
+            self._done.put((request.request_id, nonce, kind, outcome))
             self._wakeup()
 
         def watchdog() -> None:
             if not future.done():
                 future.cancel()
-                enqueue((None, manifest_chain))
 
-        timer = threading.Timer(
-            coordination.probe_timeout + _WATCHDOG_HEADROOM_S, watchdog
-        )
+        timer = threading.Timer(coordination.probe_timeout + PROBE_HEADROOM_S, watchdog)
         timer.daemon = True
 
         def done(future: Any) -> None:
             timer.cancel()
             try:
                 outcome = future.result()
-            except Exception:
-                logger.warning("[LWD] probe failed; using full prefill", exc_info=True)
-                outcome = (None, manifest_chain)
-            enqueue(outcome)
+            except BaseException as exc:
+                logger.warning(
+                    "[LWD] probe batch failed; using full prefill", exc_info=True
+                )
+                outcome = tuple((target, None, None, 0, exc) for target in targets)
+            enqueue("probe", outcome)
 
         future.add_done_callback(done)
         timer.start()
         return LwdProbeSubmission.SUBMITTED
 
+    def _model_name(self) -> str:
+        model_config = self._vllm_config.model_config
+        return model_config.served_model_name or model_config.model
+
+    def activate(
+        self,
+        completion: LwdProbeCompletion,
+        connection_id: LwdConnectionId,
+        candidate: LwdProbeCandidate | None,
+    ) -> bool:
+        request = completion.request
+        inflight = self._inflight.get(request.request_id)
+        if inflight is None or self._runtime is None:
+            return False
+        runtime = self._runtime
+        coordination = self._vllm_config.lwd_config.coordination
+        block_size = (
+            candidate.result.block_size
+            if candidate is not None
+            else self._hash_sizes.get(
+                (connection_id.cloud_id, connection_id.dp_idx),
+                self._vllm_config.cache_config.block_size,
+            )
+        )
+        client = self._client(connection_id, block_size)
+        inflight.connection_id = connection_id
+        inflight.candidate = candidate
+
+        async def job() -> str | None:
+            try:
+                session = await runtime.ensure_session()
+                manifest = client.build_manifest(
+                    request.request_id,
+                    list(request.prompt_token_ids),
+                    media_items=inflight.media_items,
+                )
+                drain_task = await client.activate(
+                    session,
+                    request.request_id,
+                    list(request.prompt_token_ids),
+                    edge_id=inflight.edge_id,
+                    cloud_id=connection_id.cloud_id,
+                    dp_idx=connection_id.dp_idx,
+                    probe_nonce=inflight.nonce,
+                    manifest=manifest,
+                    media_items=inflight.media_items,
+                    model=self._model_name(),
+                )
+                inflight.drain_task = drain_task
+                if (
+                    inflight.cancelled
+                    or self._inflight.get(request.request_id) is not inflight
+                ):
+                    runtime.cancel_task(drain_task)
+                return None
+            except Exception as exc:  # noqa: BLE001
+                return str(exc)
+
+        future = runtime.submit(job(), timeout=coordination.probe_timeout)
+        inflight.future = future
+
+        def done(future: Any) -> None:
+            try:
+                error = future.result()
+            except BaseException as exc:
+                error = str(exc)
+            self._done.put((request.request_id, inflight.nonce, "activate", error))
+            self._wakeup()
+
+        future.add_done_callback(done)
+        return True
+
+    def mark_admitted(self, request_id: str, nonce: int) -> None:
+        inflight = self._inflight.get(request_id)
+        if inflight is not None and inflight.nonce == nonce:
+            self._inflight.pop(request_id, None)
+
     def abort(self, request_id: str) -> None:
-        self._inflight.pop(request_id, None)
+        inflight = self._inflight.pop(request_id, None)
+        if inflight is None:
+            return
+        inflight.cancelled = True
+        if inflight.future is not None:
+            inflight.future.cancel()
+        if inflight.drain_task is not None and self._runtime is not None:
+            self._runtime.cancel_task(inflight.drain_task)
 
     def drain(self) -> list[LwdProbeCompletion]:
-        """Return each current completion once; stale retries are discarded."""
         completions: list[LwdProbeCompletion] = []
         while True:
             try:
-                request_id, nonce, build_size, outcome, target = self._done.get_nowait()
+                request_id, nonce, kind, outcome = self._done.get_nowait()
             except queue.Empty:
                 break
             inflight = self._inflight.get(request_id)
             if inflight is None or inflight.nonce != nonce:
                 continue
-            del self._inflight[request_id]
-            if target is not None:
-                if outcome is None or outcome[0] is None:
-                    self._health.record_failure(target)
-                else:
-                    self._health.record_success(target)
-            if outcome is None:
-                completions.append(
-                    LwdProbeCompletion(inflight.request, None, None, target, build_size)
-                )
-                continue
-            result, chain = outcome
-            if result is None:
+            if kind == "activate":
+                connection_id = inflight.connection_id
+                candidate = inflight.candidate
                 completions.append(
                     LwdProbeCompletion(
-                        inflight.request, None, chain, target, build_size
+                        inflight.request,
+                        probe_nonce=nonce,
+                        connection_id=connection_id,
+                        result=candidate.result if candidate is not None else None,
+                        chain=candidate.chain if candidate is not None else None,
+                        activated=True,
+                        activation_error=outcome,
                     )
                 )
                 continue
-            learned = int(result.block_size)
-            self._hash_sizes[self._cloud_for_result(target, result)] = learned
-            if chain is not None and learned != build_size:
-                coordination = self._vllm_config.lwd_config.coordination
-                url = (
-                    coordination.control_url_map[target]
-                    if target is not None
-                    else coordination.control_url
-                )
-                rebuilt = self._client(
-                    self._cloud_for_result(target, result), learned, url
-                ).build_manifest(
-                    request_id,
-                    list(inflight.request.prompt_token_ids),
-                    media_items=inflight.media_items,
-                )
-                chain = list(rebuilt.full_block_hashes)
+            candidates: list[LwdProbeCandidate] = []
+            failed: list[LwdConnectionId] = []
+            for target, result, chain, build_size, error in outcome:
+                dp_id = (target.cloud_id, target.dp_idx)
+                if error is not None or result is None:
+                    self._health.record_failure(dp_id)
+                    failed.append(target)
+                    continue
+                self._health.record_success(dp_id)
+                learned = int(result.block_size)
+                self._hash_sizes[dp_id] = learned
+                if chain is not None and learned != build_size:
+                    rebuilt = self._client(target, learned).build_manifest(
+                        request_id,
+                        list(inflight.request.prompt_token_ids),
+                        media_items=inflight.media_items,
+                    )
+                    chain = list(rebuilt.full_block_hashes)
+                candidates.append(LwdProbeCandidate(target, result, chain))
             completions.append(
-                LwdProbeCompletion(inflight.request, result, chain, target, build_size)
+                LwdProbeCompletion(
+                    inflight.request,
+                    probe_nonce=nonce,
+                    candidates=tuple(candidates),
+                    failed_targets=tuple(failed),
+                )
             )
         return completions
 
-    @staticmethod
-    def _cloud_for_result(target: int | None, result: LwdProbeResult) -> int:
-        if target is not None:
-            return target
-        return result.cloud_id if result.cloud_id is not None else 0
-
     def close(self) -> None:
-        if self._runtime is not None:
-            self._runtime.stop()
-            self._runtime = None
+        inflights = list(self._inflight.values())
         self._inflight.clear()
+        runtime = self._runtime
+        for inflight in inflights:
+            inflight.cancelled = True
+            if inflight.future is not None:
+                inflight.future.cancel()
+            if inflight.drain_task is not None and runtime is not None:
+                runtime.cancel_task(inflight.drain_task)
+        if runtime is not None:
+            runtime.stop()
+            self._runtime = None

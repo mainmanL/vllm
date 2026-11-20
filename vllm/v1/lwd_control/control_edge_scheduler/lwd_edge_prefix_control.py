@@ -92,10 +92,6 @@ class LwdEdgePrefixControl:
         self._pending[request.request_id] = (request, timer)
         try:
             submission = engine._lwd_probe_manager.submit(request)
-            if submission is LwdProbeSubmission.ALREADY_INFLIGHT:
-                self._pending.pop(request.request_id, None)
-                timer.cancel()
-                return
             if submission is LwdProbeSubmission.UNAVAILABLE:
                 engine._lwd_add_request_after_probe(request)
         except Exception:

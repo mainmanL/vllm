@@ -8,31 +8,13 @@ from lwd_config_under_test import LwdTopology
 from sample_topologies import PAYLOADS, topology_payload
 
 
-def with_required_coordination(raw: dict) -> dict:
-    if raw["deployment"]["scene"] not in ("cloud_share", "lwd_cluster"):
-        return raw
-    control_url = {
-        cloud["id"]: f"http://{cloud['dp'][0]['addr']}:8100/v1/chat/completions"
-        for cloud in raw["clouds"]
-    }
-    for edge in raw["edges"]:
-        edge["coordination"] = {
-            "enabled": True,
-            "control_url": control_url,
-            "tenant_key_file": "/run/secrets/edge-cloud-tenant-key",
-        }
-    for cloud in raw["clouds"]:
-        cloud["coordination"] = {"enabled": True}
-    return raw
-
-
 def cloud_reuse(dp: int = 2) -> dict:
-    return with_required_coordination(topology_payload(f"s3_cloud_share_{dp}dp.yaml"))
+    return topology_payload(f"s3_cloud_share_{dp}dp.yaml")
 
 
 @pytest.mark.parametrize("name", sorted(PAYLOADS))
 def test_original_eight_layouts_keep_rank_and_link_contract(name: str) -> None:
-    topology = LwdTopology.from_dict(with_required_coordination(topology_payload(name)))
+    topology = LwdTopology.from_dict(topology_payload(name))
     expected = {
         "single_instance": (9, 1),
         "edge_share": (17, 2),
@@ -86,7 +68,7 @@ def test_invalid_topology_fails_before_runtime(fault: str, match: str) -> None:
         for dp in raw["clouds"][0]["dp"]:
             dp["ranks"] = [r - 1 for r in dp["ranks"]]
     elif fault == "missing_link":
-        raw["instance_links"].pop()
+        raw["instance_links"] = [{"edge": 0, "cloud": 0}]
     elif fault == "port_collision":
         raw["clouds"][0]["dp"][1]["ctrl_port"] = 5550
     elif fault == "world_gap":
@@ -261,7 +243,7 @@ def host_payload(name: str = "s2_edge_share_2dp.yaml") -> dict:
         for dp in cloud["dp"]:
             dp["data_port"] = port
             port += 1
-    return with_required_coordination(raw)
+    return raw
 
 
 @pytest.mark.parametrize("name", HOST_SAMPLES)
@@ -330,4 +312,183 @@ def test_device_layout_requires_ranks_and_world_size(fault: str, match: str) -> 
     else:
         raw["deployment"].pop("hccl_world_size")
     with pytest.raises(ValueError, match=match):
+        LwdTopology.from_dict(raw)
+
+
+def test_omitted_links_derive_deterministic_full_mesh_and_digest() -> None:
+    implicit = LwdTopology.from_dict(cloud_reuse(1))
+    explicit_raw = cloud_reuse(1)
+    explicit_raw["instance_links"] = [
+        {"edge": 1, "cloud": 0},
+        {"edge": 0, "cloud": 0},
+    ]
+    explicit = LwdTopology.from_dict(explicit_raw)
+    assert [(link.edge, link.cloud) for link in implicit.instance_links] == [
+        (0, 0),
+        (1, 0),
+    ]
+    assert set(implicit.instance_links) == set(explicit.instance_links)
+    assert implicit.digest == explicit.digest
+
+
+def test_edge_share_omitted_links_derive_full_mesh_then_fail_scene() -> None:
+    raw = topology_payload("s2_edge_share_2dp.yaml")
+    del raw["instance_links"]
+    with pytest.raises(ValueError, match="one-to-one instance links"):
+        LwdTopology.from_dict(raw)
+
+
+@pytest.mark.parametrize(
+    "links,match",
+    [
+        ([], "at least 1"),
+        (
+            [{"edge": 0, "cloud": 0}, {"edge": 0, "cloud": 0}],
+            "duplicate instance link",
+        ),
+        ([{"edge": 0, "cloud": 2}], "unknown edge/cloud"),
+    ],
+)
+def test_explicit_links_keep_strict_validation(links: list, match: str) -> None:
+    raw = cloud_reuse(1)
+    raw["instance_links"] = links
+    with pytest.raises(ValueError, match=match):
+        LwdTopology.from_dict(raw)
+
+
+def test_coord_url_is_derived_and_available_on_every_connection() -> None:
+    raw = cloud_reuse()
+    expected_digest = LwdTopology.from_dict(raw).digest
+    for cloud in raw["clouds"]:
+        for dp in cloud["dp"]:
+            del dp["coord_url"]
+    topology = LwdTopology.from_dict(raw)
+    assert topology.digest == expected_digest
+    for connection in topology.connections("edge", 0):
+        cloud = connection.cloud
+        assert cloud.coord_url == f"http://{cloud.addr}:{cloud.coord_port}"
+        assert cloud.coord_port == 8100 + cloud.dp_idx
+
+
+def test_probe_poll_budget_yaml_config() -> None:
+    raw = topology_payload("s1_single_instance_1dp.yaml")
+    coordination = raw["clouds"][0]["coordination"]
+    assert LwdTopology.from_dict(raw).clouds[0].coordination.probe_poll_budget == 32
+    coordination["probe_poll_budget"] = 2
+    assert LwdTopology.from_dict(raw).clouds[0].coordination.probe_poll_budget == 2
+    coordination["probe_poll_budget"] = 0
+    with pytest.raises(ValueError):
+        LwdTopology.from_dict(raw)
+
+
+def test_explicit_gateway_coord_url_and_ipv6_derivation() -> None:
+    raw = topology_payload("s1_single_instance_1dp.yaml")
+    dp = raw["clouds"][0]["dp"][0]
+    dp["coord_url"] = "https://gateway.example.com:443"
+    topology = LwdTopology.from_dict(raw)
+    assert topology.clouds[0].dp[0].coord_url == "https://gateway.example.com:443"
+    assert topology.clouds[0].dp[0].coord_port == 8100
+
+    dp["addr"] = "2001:db8::1"
+    dp["ctrl_port"] = 5550
+    dp["coord_port"] = 8100
+    del dp["coord_url"]
+    topology = LwdTopology.from_dict(raw)
+    assert topology.clouds[0].dp[0].coord_url == "http://[2001:db8::1]:8100"
+
+
+def test_gateway_coord_url_can_be_shared_by_all_dps() -> None:
+    raw = topology_payload("s4_lwd_cluster_2dp.yaml")
+    for cloud in raw["clouds"]:
+        for dp in cloud["dp"]:
+            dp["coord_url"] = "https://gateway.example.com:443"
+    topology = LwdTopology.from_dict(raw)
+    assert {dp.coord_url for cloud in topology.clouds for dp in cloud.dp} == {
+        "https://gateway.example.com:443"
+    }
+    assert [dp.coord_port for cloud in topology.clouds for dp in cloud.dp] == [
+        dp["coord_port"] for cloud in raw["clouds"] for dp in cloud["dp"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "url,match",
+    [
+        ("ftp://10.1.0.1:8100", "HTTP"),
+        ("http://0.0.0.0:8100", "routable"),
+        ("http://bad host:8100", "whitespace"),
+        ("http://10.1.0.1", "explicit port"),
+        ("http://10.1.0.1:0", "explicit port"),
+    ],
+)
+def test_coord_url_rejects_invalid_endpoint(url: str, match: str) -> None:
+    raw = topology_payload("s1_single_instance_1dp.yaml")
+    raw["clouds"][0]["dp"][0]["coord_url"] = url
+    with pytest.raises(ValueError, match=match):
+        LwdTopology.from_dict(raw)
+
+
+def test_coord_url_requires_coord_port() -> None:
+    raw = topology_payload("s1_single_instance_1dp.yaml")
+    del raw["clouds"][0]["dp"][0]["coord_port"]
+    with pytest.raises(ValueError, match="coord_url requires coord_port"):
+        LwdTopology.from_dict(raw)
+
+
+def test_enabled_cloud_requires_coord_port_on_every_dp() -> None:
+    raw = cloud_reuse()
+    dp = raw["clouds"][0]["dp"][1]
+    del dp["coord_port"]
+    del dp["coord_url"]
+    with pytest.raises(ValueError, match="enabled cloud coordination"):
+        LwdTopology.from_dict(raw)
+
+
+def test_enabled_edge_requires_complete_linked_cloud_endpoints() -> None:
+    raw = topology_payload("s1_single_instance_1dp.yaml")
+    raw["edges"][0]["coordination"] = {
+        "enabled": True,
+        "tenant_key_file": "/run/secrets/edge-cloud-tenant-key",
+    }
+    dp = raw["clouds"][0]["dp"][0]
+    del dp["coord_port"]
+    del dp["coord_url"]
+    with pytest.raises(ValueError, match="enabled edge coordination"):
+        LwdTopology.from_dict(raw)
+
+
+@pytest.mark.parametrize("field", ["control_url", "control_url_map", "listen_port"])
+def test_retired_instance_coordination_fields_are_rejected(field: str) -> None:
+    raw = cloud_reuse(1)
+    value = "http://10.1.0.1:8100" if field == "control_url" else 8100
+    if field == "control_url_map":
+        value = {0: "http://10.1.0.1:8100"}
+    raw["edges"][0]["coordination"][field] = value
+    with pytest.raises(ValueError, match="coord_port/coord_url"):
+        LwdTopology.from_dict(raw)
+
+
+@pytest.mark.parametrize("conflict", ["coord", "ctrl_same_dp", "ctrl_other_dp"])
+def test_coord_port_collisions_are_rejected(conflict: str) -> None:
+    raw = cloud_reuse()
+    first, second = raw["clouds"][0]["dp"]
+    if conflict == "coord":
+        second["coord_port"] = first["coord_port"]
+    elif conflict == "ctrl_same_dp":
+        first["coord_port"] = first["ctrl_port"]
+    else:
+        second["coord_port"] = first["ctrl_port"]
+    for dp in (first, second):
+        dp["coord_url"] = f"http://{dp['addr']}:{dp['coord_port']}"
+    match = "different coord_port" if conflict == "coord" else "coord_port conflicts"
+    with pytest.raises(ValueError, match=match):
+        LwdTopology.from_dict(raw)
+
+
+def test_coord_port_cannot_collide_with_host_data_port() -> None:
+    raw = host_payload("s1_single_instance_1dp.yaml")
+    dp = raw["clouds"][0]["dp"][0]
+    dp["coord_port"] = dp["data_port"]
+    dp["coord_url"] = f"http://{dp['addr']}:{dp['coord_port']}"
+    with pytest.raises(ValueError, match="coord_port conflicts with data_port"):
         LwdTopology.from_dict(raw)

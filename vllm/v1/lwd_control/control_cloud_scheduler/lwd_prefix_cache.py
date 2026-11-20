@@ -8,6 +8,8 @@ from __future__ import annotations
 from math import lcm
 from typing import TYPE_CHECKING, NamedTuple
 
+from vllm.lwd_logger import lwd_logger
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -25,6 +27,7 @@ if TYPE_CHECKING:
 class _LwdPrefixReservation(NamedTuple):
     groups: tuple[Sequence[KVCacheBlock], ...]
     hit_tokens: int
+    shared_prefix_boundary: int
     pinned: list[KVCacheBlock]
 
 
@@ -44,23 +47,38 @@ class LwdPrefixReservations:
         if request.skip_reading_prefix_cache:
             groups: tuple[Sequence[KVCacheBlock], ...] = ()
             hit = 0
+            shared_prefix_boundary = 0
         else:
-            groups, hit, _ = self.manager.coordinator.find_longest_cache_hit(
+            groups, hit, uncached = self.manager.coordinator.find_longest_cache_hit(
                 request.block_hashes,
                 max_cache_hit_length=max(0, request.num_prompt_tokens - 1),
             )
-        return self._touch_and_snapshot(request, groups, hit, set_floor=True)
+            shared_prefix_boundary = hit + uncached if uncached else 0
+        return self._touch_and_snapshot(
+            request,
+            groups,
+            hit,
+            shared_prefix_boundary,
+            set_floor=True,
+        )
 
     def reserve_hit(
         self,
         request: Request,
         groups: tuple[Sequence[KVCacheBlock], ...],
         hit: int,
+        shared_prefix_boundary: int,
     ) -> int:
         """Reserve a readmission hit without changing the staging floor."""
         if request.request_id in self._reservations:
             raise ValueError(f"duplicate LWD prefix reservation: {request.request_id}")
-        return self._touch_and_snapshot(request, groups, hit, set_floor=False)
+        return self._touch_and_snapshot(
+            request,
+            groups,
+            hit,
+            shared_prefix_boundary,
+            set_floor=False,
+        )
 
     def touch(self, groups: tuple[Sequence[KVCacheBlock], ...]) -> list[KVCacheBlock]:
         """Pin real blocks while preserving null slots only in the snapshot."""
@@ -76,20 +94,21 @@ class LwdPrefixReservations:
 
     def snapshot(
         self, request: Request
-    ) -> tuple[tuple[Sequence[KVCacheBlock], ...], int]:
-        """Return the frozen hit, refusing to renegotiate a trimmed request."""
+    ) -> tuple[tuple[Sequence[KVCacheBlock], ...], int, int]:
+        """Return the frozen hit and shared-prefix boundary."""
         entry = self._reservations.get(request.request_id)
         if entry is not None:
-            return entry.groups, entry.hit_tokens
+            return entry.groups, entry.hit_tokens, entry.shared_prefix_boundary
         if getattr(request, "lwd_resume_cap_tokens", None) is not None:
             raise RuntimeError(
                 f"LWD reserved prefix for {request.request_id} is unavailable; "
                 "cannot consume trimmed embeddings"
             )
-        groups, hit, _ = self.manager.coordinator.find_longest_cache_hit(
+        groups, hit, uncached = self.manager.coordinator.find_longest_cache_hit(
             request.block_hashes, request.num_tokens - 1
         )
-        return groups, hit
+        shared_prefix_boundary = hit + uncached if uncached else 0
+        return groups, hit, shared_prefix_boundary
 
     def truncate(
         self,
@@ -124,6 +143,7 @@ class LwdPrefixReservations:
         request: Request,
         groups: tuple[Sequence[KVCacheBlock], ...],
         hit: int,
+        shared_prefix_boundary: int,
         *,
         set_floor: bool,
     ) -> int:
@@ -131,7 +151,18 @@ class LwdPrefixReservations:
         self._reservations[request.request_id] = _LwdPrefixReservation(
             groups=tuple(tuple(group) for group in groups),
             hit_tokens=hit,
+            shared_prefix_boundary=shared_prefix_boundary,
             pinned=pinned,
+        )
+        lwd_logger.debug(
+            "[LWD][prefix] SNAPSHOT req=%s hit=%d boundary=%d "
+            "uncached=%d prompt=%d initial=%s",
+            request.request_id,
+            hit,
+            shared_prefix_boundary,
+            shared_prefix_boundary - hit if shared_prefix_boundary else 0,
+            request.num_prompt_tokens,
+            set_floor,
         )
         if set_floor:
             request.lwd_resume_cap_tokens = hit
@@ -298,7 +329,4 @@ class LwdProbeQueryAdapter:
         )
 
     def peek(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
-        return self._query(manifest)
-
-    def probe(self, manifest: LwdPrefixManifest) -> LwdProbeResult:
         return self._query(manifest)

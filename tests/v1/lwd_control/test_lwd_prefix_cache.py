@@ -18,9 +18,28 @@ from vllm.v1.lwd_control.control_cloud_scheduler.lwd_prefix_cache import (
     init_lwd_prefix_cache,
     prefix_start,
 )
+from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
+    LwdBaseScheduler,
+)
+from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
+    mm_abi_header_value,
+    negotiate_lwd_protocol,
+)
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     DIGEST_SIZE,
+    HEADER_ALIGNMENT_TOKENS,
+    HEADER_BLOCK_SIZE,
+    HEADER_CLOUD_ID,
+    HEADER_ENGINE_INDEX,
+    HEADER_HIT_BLOCKS,
+    HEADER_HIT_TOKENS,
+    HEADER_INSTANCE_ID,
+    HEADER_PROTOCOL,
+    HEADER_REQUEST_ID,
+    PROTOCOL_VERSION,
+    PROTOCOL_VERSION_MM,
     LwdPrefixManifest,
+    LwdProbeResult,
 )
 
 
@@ -67,7 +86,7 @@ def test_reserve_pins_real_blocks_and_freezes_snapshot() -> None:
     assert reservations.reserve(request) == 16
     manager.block_pool.touch.assert_called_once_with([block])
     assert request.lwd_resume_cap_tokens == 16
-    assert reservations.snapshot(request) == (((block, null_block),), 16)
+    assert reservations.snapshot(request) == (((block, null_block),), 16, 0)
 
     reservations.release("r")
     reservations.release("r")
@@ -76,13 +95,13 @@ def test_reserve_pins_real_blocks_and_freezes_snapshot() -> None:
 
 def test_reserve_miss_snapshot_does_not_change_with_cache_growth() -> None:
     block = SimpleNamespace(is_null=False)
-    manager = _manager()
+    manager = _manager(uncached=32)
     reservations = LwdPrefixReservations(manager)
     request = _request()
     assert reservations.reserve(request) == 0
 
     manager.coordinator.find_longest_cache_hit.return_value = (([block],), 16, 0)
-    assert reservations.snapshot(request) == ((), 0)
+    assert reservations.snapshot(request) == ((), 0, 32)
     assert manager.coordinator.find_longest_cache_hit.call_count == 1
 
 
@@ -92,7 +111,7 @@ def test_skip_reading_reserves_zero_without_lookup() -> None:
     request = _request(skip=True)
 
     assert reservations.reserve(request) == 0
-    assert reservations.snapshot(request) == ((), 0)
+    assert reservations.snapshot(request) == ((), 0, 0)
     manager.coordinator.find_longest_cache_hit.assert_not_called()
     manager.block_pool.touch.assert_not_called()
 
@@ -111,9 +130,9 @@ def test_reserve_hit_preserves_floor_and_truncate_preserves_layout() -> None:
     truncated = reservations.truncate((blocks,), 32)
     assert truncated == (blocks[:2],)
     assert len(blocks) == 3
-    assert reservations.reserve_hit(request, truncated, 32) == 32
+    assert reservations.reserve_hit(request, truncated, 32, 48) == 32
     assert request.lwd_resume_cap_tokens == 48
-    assert reservations.snapshot(request) == ((tuple(blocks[:2]),), 32)
+    assert reservations.snapshot(request) == ((tuple(blocks[:2]),), 32, 48)
     assert prefix_start(request, reservations) == 32
 
 
@@ -145,10 +164,10 @@ def test_lwd_kv_and_connector_apis_return_frozen_triple() -> None:
 
     blocks, hit, boundary = manager.get_computed_blocks(request)
     assert blocks.blocks == ((block,),)
-    assert (hit, boundary) == (16, 0)
+    assert (hit, boundary) == (16, 32)
 
     connector_result = manager.get_computed_blocks_for_connector(request)
-    assert connector_result == (blocks, 16, 0, False)
+    assert connector_result == (blocks, 16, 32, False)
 
 
 def test_lwd_connector_missing_snapshot_fails_closed() -> None:
@@ -214,7 +233,7 @@ def test_probe_query_without_prefix_caching_skips_block_size_contract() -> None:
         prefix_caching=False,
     )
 
-    result = adapter.probe(_manifest(block_size=16))
+    result = adapter.peek(_manifest(block_size=16))
 
     assert (result.block_size, result.hit_blocks, result.hit_tokens) == (16, 0, 0)
     assert result.cloud_id == 0
@@ -231,7 +250,7 @@ def test_probe_query_with_prefix_caching_enforces_block_size() -> None:
     )
 
     with pytest.raises(ValueError, match="must match the cloud hash block size"):
-        adapter.probe(_manifest(block_size=16))
+        adapter.peek(_manifest(block_size=16))
 
 
 def test_probe_query_with_prefix_caching_reports_cloud_hit() -> None:
@@ -244,7 +263,7 @@ def test_probe_query_with_prefix_caching_reports_cloud_hit() -> None:
         cloud_id=1,
     )
 
-    result = adapter.probe(_manifest(block_size=16))
+    result = adapter.peek(_manifest(block_size=16))
 
     assert (result.block_size, result.hit_tokens, result.cloud_id) == (16, 32, 1)
 
@@ -332,3 +351,122 @@ def test_readmission_clamp_uses_fine_grained_alignment() -> None:
     assert refill_calls == [("r", 2944, 6656, 0)]
     assert "r" in state._lwd_refill_gate
     assert state._lwd_refill_pending["r"].hit_tokens == 2944
+
+
+def test_readmission_preserves_junction_when_arrival_clamps_hit() -> None:
+    groups = ([SimpleNamespace(is_null=False) for _ in range(500)],)
+    reservations = LwdPrefixReservations(_manager())
+    coordinator = SimpleNamespace(cache_hit_alignment_tokens=128)
+    coordinator.find_longest_cache_hit = Mock(return_value=(groups, 6400, 256))
+    state = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(coordinator=coordinator),
+        lwd_prefix_reservations=reservations,
+        lwd_prefix_hits={},
+        lwd_recv_rows={"r": 3000},
+        _lwd_refill_gate=set(),
+        _lwd_refill_pending={},
+        lwd_refill_sender=Mock(),
+    )
+    request = _request(floor=6400)
+    request.num_prompt_tokens = 6656
+
+    assert LwdCloudScheduler._lwd_prep_prefix_readmission(state, request) is False
+    _, hit, boundary = reservations.snapshot(request)
+    assert (hit, boundary) == (2944, 6656)
+
+
+def test_cloud_scheduler_keeps_sparse_retention_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kv_cache_config = SimpleNamespace(prefix_cache_retention_interval=0)
+
+    def init_base(self, vllm_config, kv_cache_config) -> None:
+        self.vllm_config = vllm_config
+        assert kv_cache_config.prefix_cache_retention_interval == 0
+
+    monkeypatch.setattr(LwdBaseScheduler, "__init__", init_base)
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=True)
+    )
+
+    LwdCloudScheduler(vllm_config, kv_cache_config)
+
+    assert kv_cache_config.prefix_cache_retention_interval == 0
+
+
+def test_probe_result_wire_shapes_share_the_same_fields() -> None:
+    result = LwdProbeResult(
+        request_id="r",
+        instance_id="cloud-0",
+        block_size=16,
+        hit_blocks=2,
+        hit_tokens=32,
+        alignment_tokens=128,
+        cloud_id=1,
+        engine_index=2,
+    )
+
+    assert result.to_headers() == {
+        HEADER_PROTOCOL: PROTOCOL_VERSION,
+        HEADER_REQUEST_ID: "r",
+        HEADER_INSTANCE_ID: "cloud-0",
+        HEADER_BLOCK_SIZE: "16",
+        HEADER_HIT_BLOCKS: "2",
+        HEADER_HIT_TOKENS: "32",
+        HEADER_ALIGNMENT_TOKENS: "128",
+        HEADER_CLOUD_ID: "1",
+        HEADER_ENGINE_INDEX: "2",
+    }
+    message = result.to_control_message()
+    assert message == {
+        "type": "edge_cloud_probe",
+        "protocol": PROTOCOL_VERSION,
+        "request_id": "r",
+        "instance_id": "cloud-0",
+        "block_size": 16,
+        "hit_blocks": 2,
+        "hit_tokens": 32,
+        "alignment_tokens": 128,
+        "cloud_id": 1,
+        "engine_index": 2,
+    }
+    assert LwdProbeResult.from_headers(result.to_headers()) == result
+    assert LwdProbeResult.from_control_message(message) == result
+
+
+def test_protocol_mm_abi_validation_matrix() -> None:
+    local_abi = mm_abi_header_value(bytes(range(DIGEST_SIZE)))
+    peer_abi = mm_abi_header_value(bytes(reversed(range(DIGEST_SIZE))))
+
+    assert negotiate_lwd_protocol(PROTOCOL_VERSION, None) is None
+    with pytest.raises(ValueError, match="requires protocol"):
+        negotiate_lwd_protocol(PROTOCOL_VERSION, local_abi)
+    with pytest.raises(ValueError, match="missing required header"):
+        negotiate_lwd_protocol(
+            PROTOCOL_VERSION_MM,
+            None,
+            expected_mm_abi=local_abi,
+            enforce_mm_abi_match=False,
+        )
+    with pytest.raises(ValueError, match="did not acknowledge"):
+        negotiate_lwd_protocol(
+            PROTOCOL_VERSION,
+            None,
+            expected_protocol=PROTOCOL_VERSION_MM,
+            expected_mm_abi=local_abi,
+        )
+    with pytest.raises(ValueError, match="does not match"):
+        negotiate_lwd_protocol(
+            PROTOCOL_VERSION_MM,
+            peer_abi,
+            expected_mm_abi=local_abi,
+        )
+    assert (
+        negotiate_lwd_protocol(
+            PROTOCOL_VERSION_MM,
+            peer_abi,
+            expected_mm_abi=local_abi,
+            enforce_mm_abi_match=False,
+        )
+        == local_abi
+    )

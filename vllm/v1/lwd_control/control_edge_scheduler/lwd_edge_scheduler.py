@@ -110,7 +110,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         super().__init__(*args, **kwargs)
         self._lwd_prefix_hash_block_size = 0
         self._lwd_pending_refills: deque[SchedulerOutput] = deque()
-        self._lwd_announced_refills: set[tuple[int, int]] = set()
+        self._lwd_announced_refills: set[tuple[LwdConnectionId, int]] = set()
         # Injected by the engine once every cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self.lwd_refill_abort: Callable[[str], None] | None = None
@@ -203,6 +203,39 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         if self._lwd_edge_share:
             return request.client_index
         return self._lwd_instance_id
+
+    def lwd_select_probe_target(
+        self, request: Request, hits: dict[LwdConnectionId, int]
+    ) -> LwdConnectionId:
+        """Select a probe winner without pinning or charging an account."""
+        edge_id = self._lwd_edge_id_of(request)
+        candidates = {
+            connection_id: self._lwd_accounts[connection_id]
+            for connection_id in self._lwd_connections
+            if connection_id.edge_id == edge_id
+        }
+        if hits:
+            best_hit = max(hits.values())
+            candidates = {
+                connection_id: account
+                for connection_id, account in candidates.items()
+                if hits.get(connection_id) == best_hit
+            }
+        if not candidates:
+            raise RuntimeError(f"[LWD] no probe target for edge_id={edge_id}")
+        best = min(
+            candidates.values(),
+            key=lambda account: (
+                account.score(),
+                (
+                    self._lwd_connections.index(account.connection_id)
+                    - self._lwd_last_engine
+                    - 1
+                )
+                % len(self._lwd_connections),
+            ),
+        )
+        return best.connection_id
 
     def _lwd_route_request(
         self, request_id: str, edge_id: int, preferred: LwdConnectionId | None = None
@@ -408,15 +441,12 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         completion, replaced by the engine proxy with a placeholder) only
         consume send watermarks."""
         watermarks = getattr(model_runner_output, "lwd_up_send_watermarks", {})
-        for dp_idx, watermark in watermarks.items():
-            if isinstance(dp_idx, int):
-                # Legacy single-cloud worker/test producers used link indices.
-                dp_idx = self._lwd_connections[dp_idx]
-            self._lwd_accounts[dp_idx].note_send_watermark(watermark)
+        for connection_id, watermark in watermarks.items():
+            self._lwd_accounts[connection_id].note_send_watermark(watermark)
             self._lwd_announced_refills = {
                 key
                 for key in getattr(self, "_lwd_announced_refills", set())
-                if key[0] != dp_idx or key[1] > watermark
+                if key[0] != connection_id or key[1] > watermark
             }
         batch = getattr(scheduler_output, "lwd_batch", None)
         outputs: dict[int, list[EngineCoreOutput]] = {}
@@ -1018,8 +1048,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return
         refill_batches = {
             seqno: set(account.pending_batches[seqno])
-            for dp_idx, seqno in getattr(self, "_lwd_announced_refills", set())
-            if dp_idx == account.dp_idx
+            for connection_id, seqno in getattr(self, "_lwd_announced_refills", set())
+            if connection_id == account.connection_id
             and seqno in account.pending_batches
             and request_id in account.pending_batches[seqno]
         }

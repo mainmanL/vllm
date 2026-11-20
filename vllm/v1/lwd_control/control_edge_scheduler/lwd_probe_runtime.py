@@ -52,15 +52,45 @@ class LwdProbeRuntime:
             )
         return self._session
 
-    def submit(self, coroutine: Coroutine[Any, Any, Any]) -> Future[Any]:
-        """Submit one probe, bounding queued and executing HTTP work."""
-
-        async def bounded() -> Any:
-            assert self._inflight is not None
+    async def _bounded(self, coroutine: Coroutine[Any, Any, Any]) -> Any:
+        assert self._inflight is not None
+        entered = False
+        try:
             async with self._inflight:
+                entered = True
                 return await coroutine
+        except BaseException:
+            if not entered:
+                coroutine.close()
+            raise
 
-        return asyncio.run_coroutine_threadsafe(bounded(), self._loop)
+    def submit(
+        self, coroutine: Coroutine[Any, Any, Any], *, timeout: float | None = None
+    ) -> Future[Any]:
+        """Submit work, optionally bounding queueing and execution together."""
+        if timeout is None:
+            return asyncio.run_coroutine_threadsafe(
+                self._bounded(coroutine), self._loop
+            )
+
+        async def bounded_with_timeout() -> Any:
+            return await asyncio.wait_for(self._bounded(coroutine), timeout)
+
+        return asyncio.run_coroutine_threadsafe(bounded_with_timeout(), self._loop)
+
+    def cancel_task(self, task: asyncio.Task[Any]) -> None:
+        with contextlib.suppress(RuntimeError):
+            self._loop.call_soon_threadsafe(task.cancel)
+
+    def submit_group(self, coroutines: list[Coroutine[Any, Any, Any]]) -> Future[Any]:
+        """Run a request batch with one inflight permit per candidate DP."""
+
+        async def group() -> list[Any]:
+            return await asyncio.gather(
+                *(self._bounded(coroutine) for coroutine in coroutines)
+            )
+
+        return asyncio.run_coroutine_threadsafe(group(), self._loop)
 
     def stop(self) -> None:
         """Close the HTTP session and stop the loop without blocking the engine."""

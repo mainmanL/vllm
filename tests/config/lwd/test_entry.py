@@ -13,40 +13,23 @@ from unittest.mock import Mock
 
 import pytest
 import yaml
-from lwd_config_under_test import LwdAPIConfig, LwdConfig, resolve_lwd_config
+from lwd_config_under_test import (
+    LwdAPIConfig,
+    LwdConfig,
+    LwdCoordinationConfig,
+    resolve_lwd_config,
+)
 
 FIXTURE_NAME = "s3_cloud_share_2dp.yaml"
 StartupEntry = tuple[Callable[[], None], SimpleNamespace, Mock]
 
 
 def coordinated_topology(lwd_yaml_dir: Path, name: str) -> dict:
-    raw = yaml.safe_load((lwd_yaml_dir / name).read_text())
-    control_url = {
-        cloud["id"]: f"http://{cloud['dp'][0]['addr']}:8100/v1/chat/completions"
-        for cloud in raw["clouds"]
-    }
-    for edge in raw["edges"]:
-        edge["coordination"] = {
-            "enabled": True,
-            "control_url": control_url,
-            "tenant_key_file": "/run/secrets/edge-cloud-tenant-key",
-        }
-    for cloud in raw["clouds"]:
-        cloud["coordination"] = {"enabled": True}
-    return raw
+    return yaml.safe_load((lwd_yaml_dir / name).read_text())
 
 
-@pytest.fixture(
-    params=[
-        ("config/vllm.py", "VllmConfig", "__post_init__"),
-        ("engine/arg_utils.py", "EngineArgs", "create_engine_config"),
-    ],
-    ids=["VllmConfig", "EngineArgs"],
-)
-def startup_entry(
-    request: pytest.FixtureRequest,
-) -> StartupEntry:
-    path, class_name, method_name = request.param
+def _startup_entry(param: tuple[str, str, str]) -> StartupEntry:
+    path, class_name, method_name = param
     source = Path(__file__).resolve().parents[3] / "vllm" / path
     cls = next(
         node
@@ -73,7 +56,10 @@ def startup_entry(
     }
     exec(compile(module, str(source), "exec"), scope)
     args = SimpleNamespace(
-        additional_config={}, lwd_config=None, _resolve_mm_encoder_only=stop
+        additional_config={},
+        lwd_config=None,
+        model_config=SimpleNamespace(skip_tokenizer_init=False, multimodal_config=None),
+        _resolve_mm_encoder_only=stop,
     )
 
     def run() -> None:
@@ -81,6 +67,22 @@ def startup_entry(
             scope[method_name](args)
 
     return run, args, resolver
+
+
+@pytest.fixture(
+    params=[
+        ("config/vllm.py", "VllmConfig", "__post_init__"),
+        ("engine/arg_utils.py", "EngineArgs", "create_engine_config"),
+    ],
+    ids=["VllmConfig", "EngineArgs"],
+)
+def startup_entry(request: pytest.FixtureRequest) -> StartupEntry:
+    return _startup_entry(request.param)
+
+
+@pytest.fixture
+def engine_startup_entry() -> StartupEntry:
+    return _startup_entry(("engine/arg_utils.py", "EngineArgs", "create_engine_config"))
 
 
 @pytest.mark.parametrize("raw", [{}, {"enable_cpu_binding": True}, object()])
@@ -126,13 +128,10 @@ def test_explicit_invalid_lwd_startup_is_not_treated_as_centralized(
     resolver.assert_called_once()
 
 
-@pytest.mark.parametrize(
-    "startup_entry",
-    [("engine/arg_utils.py", "EngineArgs", "create_engine_config")],
-    indirect=True,
-)
-def test_api_attachment_without_lwd_still_fails(startup_entry: StartupEntry) -> None:
-    run, args, resolver = startup_entry
+def test_api_attachment_without_lwd_still_fails(
+    engine_startup_entry: StartupEntry,
+) -> None:
+    run, args, resolver = engine_startup_entry
     args.api_server_attach = "10.0.0.1:25100"
     with pytest.raises(ValueError, match="require lwd_config.path"):
         run()
@@ -145,7 +144,6 @@ def test_snapshot_survives_handoff_without_yaml_or_key_access(
     path = tmp_path / "topology.yaml"
     topology = coordinated_topology(lwd_yaml_dir, FIXTURE_NAME)
     topology["edges"][1]["coordination"].update(
-        control_url="http://127.0.0.1:9133/v1/chat/completions",
         tenant_key_file=str(tmp_path / "does-not-exist"),
         consumer_id="enterprise-a-edge1",
         connect_timeout=5.0,
@@ -231,15 +229,11 @@ def test_legacy_top_level_coordination_is_rejected(
         resolve_lwd_config(raw)
 
 
-@pytest.mark.parametrize("cloud_id,name", [(0, None), (1, None), (1, "custom-cloud")])
-def test_cloud_coordination_name_preserves_override_or_defaults_to_selected_cloud(
-    cloud_id: int, name: str | None, lwd_yaml_dir: Path, tmp_path: Path
+@pytest.mark.parametrize("cloud_id", [0, 1])
+def test_cloud_coordination_name_defaults_to_selected_cloud(
+    cloud_id: int, lwd_yaml_dir: Path, tmp_path: Path
 ) -> None:
-    supplied = {
-        "enabled": True,
-        "listen_port": 9133,
-        **({"instance_id": name} if name else {}),
-    }
+    supplied = {"enabled": True}
     original = supplied.copy()
     topology = yaml.safe_load((lwd_yaml_dir / "s2_edge_share_1dp.yaml").read_text())
     topology["clouds"][cloud_id]["coordination"] = supplied
@@ -251,8 +245,15 @@ def test_cloud_coordination_name_preserves_override_or_defaults_to_selected_clou
         "instance_id": cloud_id,
     }
     selected = resolve_lwd_config({"lwd_config": entry})
-    assert selected.coordination.instance_id == (name or f"cloud-{cloud_id}")
+    assert selected.coordination.instance_id == f"cloud-{cloud_id}"
     assert supplied == original
+
+
+def test_cloud_coordination_name_preserves_direct_config_override() -> None:
+    coordination = LwdCoordinationConfig.from_dict(
+        {"enabled": True, "instance_id": "custom-cloud"}, cloud_id=1
+    )
+    assert coordination.instance_id == "custom-cloud"
 
 
 def test_absent_coordination_stays_disabled(lwd_yaml_dir: Path) -> None:
@@ -284,70 +285,48 @@ def _resolve_two_cloud_edge(topology: dict, tmp_path: Path) -> LwdConfig:
     return selected
 
 
-def test_two_cloud_control_url_map_projects_with_defaults(
+def test_two_cloud_edge_projects_dp_endpoints_with_coordination_defaults(
     lwd_yaml_dir: Path, tmp_path: Path
 ) -> None:
     topology = coordinated_topology(lwd_yaml_dir, "s4_lwd_cluster_1dp.yaml")
-    expected = topology["edges"][0]["coordination"]["control_url"]
     selected = _resolve_two_cloud_edge(topology, tmp_path)
     coordination = selected.coordination
     assert coordination is not None
-    assert coordination.control_url is None
-    assert coordination.control_url_map == expected
-    assert coordination.connect_timeout == 10.0
+    assert coordination.connect_timeout == 5.0
     assert coordination.probe_timeout == 25.0
+    assert [connection.cloud.coord_url for connection in selected.connections] == [
+        "http://10.1.0.1:8100",
+        "http://10.1.0.2:8100",
+    ]
 
 
-@pytest.mark.parametrize(
-    "cloud_id,match",
-    [
-        ("cloud-zero", "valid integer"),
-        (-1, "control_url_map keys must be non-negative"),
-        (2, r"control_url_map references unknown clouds \[2\]"),
-    ],
-)
-def test_two_cloud_control_url_map_rejects_invalid_ids(
-    cloud_id: object, match: str, lwd_yaml_dir: Path, tmp_path: Path
-) -> None:
-    topology = coordinated_topology(lwd_yaml_dir, "s4_lwd_cluster_1dp.yaml")
-    topology["edges"][0]["coordination"]["control_url"] = {
-        cloud_id: "http://127.0.0.1:8100/v1/chat/completions"
-    }
-    with pytest.raises(ValueError, match=match):
-        _resolve_two_cloud_edge(topology, tmp_path)
-
-
-def test_control_url_map_and_url_map_are_mutually_exclusive(
-    lwd_yaml_dir: Path, tmp_path: Path
-) -> None:
-    topology = coordinated_topology(lwd_yaml_dir, "s4_lwd_cluster_1dp.yaml")
-    topology["edges"][0]["coordination"]["control_url_map"] = {
-        0: "http://127.0.0.1:8100/v1/chat/completions"
-    }
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        _resolve_two_cloud_edge(topology, tmp_path)
-
-
-def test_duplicate_control_url_cloud_id_is_rejected(
-    lwd_yaml_dir: Path, tmp_path: Path
-) -> None:
-    topology = coordinated_topology(lwd_yaml_dir, "s4_lwd_cluster_1dp.yaml")
-    text = yaml.safe_dump(topology, sort_keys=False)
-    url_line = next(
-        line for line in text.splitlines() if line.lstrip().startswith("0: http")
+def test_edge_coordination_no_longer_requires_a_url() -> None:
+    coordination = LwdCoordinationConfig(
+        enabled=True, tenant_key_file="/run/secrets/edge-cloud-tenant-key"
     )
-    path = tmp_path / "topology.yaml"
-    path.write_text(text.replace(url_line, f"{url_line}\n{url_line}", 1))
-    with pytest.raises(ValueError, match="duplicate YAML key"):
-        resolve_lwd_config(
-            {
-                "lwd_config": {
-                    "path": str(path),
-                    "role": "edge",
-                    "instance_id": 0,
-                }
-            }
-        )
+    coordination.validate_role("edge")
+
+
+def test_edge_coordination_still_requires_tenant_unless_placement_only() -> None:
+    with pytest.raises(ValueError, match="tenant_key_file"):
+        LwdCoordinationConfig(enabled=True).validate_role("edge")
+    LwdCoordinationConfig(enabled=True, placement_only=True).validate_role("edge")
+
+
+def test_probe_poll_budget_config_validation() -> None:
+    assert LwdCoordinationConfig().probe_poll_budget == 32
+    assert LwdCoordinationConfig(probe_poll_budget=2).probe_poll_budget == 2
+    with pytest.raises(ValueError):
+        LwdCoordinationConfig(probe_poll_budget=0)
+
+
+@pytest.mark.parametrize("field", ["control_url", "control_url_map", "listen_port"])
+def test_legacy_coordination_config_fields_are_rejected(field: str) -> None:
+    value = "http://127.0.0.1:8100" if field == "control_url" else 8100
+    if field == "control_url_map":
+        value = {0: "http://127.0.0.1:8100"}
+    with pytest.raises(ValueError, match="coord_port/coord_url"):
+        LwdCoordinationConfig.from_dict({"enabled": True, field: value})
 
 
 @pytest.mark.parametrize(
@@ -377,6 +356,6 @@ def test_api_cli_metadata_survives_snapshot_handoff(
     received_entry = pickle.loads(pickle.dumps(entry))
     assert received_entry.api == api
     assert received_entry.coordination is None
-    assert [c.connection_id.dp_idx for c in received_entry.connections] == [0, 1]
+    assert [c.connection_id.dp_idx for c in received_entry.connections] == [0, 1, 0, 1]
     assert received_entry.instance_id == identity
     assert args.additional_config == original

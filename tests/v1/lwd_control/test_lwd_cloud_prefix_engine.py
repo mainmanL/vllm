@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -29,6 +30,8 @@ def _cloud_engine() -> LwdCloudEngineCoreMixin:
     engine.scheduler = SimpleNamespace()
     engine._lwd_ledger = LwdCloudLedger(engine.scheduler)
     engine._lwd_send_prefix_ready = Mock()
+    engine._lwd_engine_index = 0
+    engine.cloud_control_event_queue = queue.Queue()
     return engine
 
 
@@ -52,6 +55,67 @@ def test_add_request_reserves_before_native_add_then_replies(
     reservations.reserve.assert_called_once_with(request)
     assert added == [request]
     engine._lwd_send_prefix_ready.assert_called_once_with("r", 32, 7)
+    assert engine.cloud_control_event_queue.get_nowait() == {
+        "type": "usage_start",
+        "request_id": "r",
+        "engine_index": 0,
+        "prefix_nonce": 7,
+    }
+
+
+def test_add_request_without_prefix_cache_uses_native_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _cloud_engine()
+    engine._lwd_prefix_enabled = False
+    request = SimpleNamespace(
+        request_id="r", lwd_prefix_nonce=7, lwd_wire_hashes_adopted=False
+    )
+    added = []
+    monkeypatch.setattr(
+        LwdBaseEngineCore, "add_request", lambda _self, req, wave=0: added.append(req)
+    )
+
+    engine.add_request(request)
+
+    assert added == [request]
+    engine._lwd_send_prefix_ready.assert_not_called()
+    assert engine.cloud_control_event_queue.get_nowait()["prefix_nonce"] == 7
+
+
+def test_add_request_without_prefix_cache_does_not_start_failed_add(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = _cloud_engine()
+    engine._lwd_prefix_enabled = False
+    request = SimpleNamespace(request_id="r", lwd_prefix_nonce=7)
+    monkeypatch.setattr(
+        LwdBaseEngineCore,
+        "add_request",
+        Mock(side_effect=RuntimeError("native add failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="native add failed"):
+        engine.add_request(request)
+    assert engine.cloud_control_event_queue.empty()
+
+
+def test_coordination_poll_wakes_engine_for_remaining_commands() -> None:
+    engine = object.__new__(LwdCloudEngineCoreMixin)
+    engine._lwd_probe_query = Mock()
+    processor = Mock()
+    processor.poll.return_value = 32
+    engine.cloud_control_processor = processor
+    engine._lwd_control_processor = processor
+    engine._lwd_coord_pending = queue.Queue()
+    engine._lwd_coord_pending.put({"type": "probe"})
+    engine.input_queue = queue.Queue()
+
+    engine._lwd_poll_coordination()
+
+    request_type, payload = engine.input_queue.get_nowait()
+    assert request_type.name == "WAKEUP"
+    assert payload is None
 
 
 def test_reserve_failure_replies_error_without_native_add(
@@ -71,6 +135,7 @@ def test_reserve_failure_replies_error_without_native_add(
 
     native_add.assert_not_called()
     engine._lwd_send_prefix_ready.assert_called_once_with("r", 0, 7, error="no blocks")
+    assert engine.cloud_control_event_queue.empty()
 
 
 def test_active_duplicate_replies_error_without_native_add(

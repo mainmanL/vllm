@@ -30,6 +30,7 @@ from typing import Any
 from vllm import envs
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
     HEADER_MM_ABI,
+    PROTOCOL_VERSION_MM,
     decode_digest,
     encode_digest,
 )
@@ -73,6 +74,34 @@ def validate_mm_abi_header(value: str | None) -> str:
     # decode_digest also validates the 32-byte length.
     decode_digest(encoded)
     return value
+
+
+def negotiate_lwd_protocol(
+    protocol: str | None,
+    mm_abi: str | None,
+    *,
+    expected_protocol: str | None = None,
+    expected_mm_abi: str | None = None,
+    enforce_mm_abi_match: bool = True,
+) -> str | None:
+    """Validate a protocol stack and return the local MM identity, if any."""
+    if expected_protocol is not None and protocol != expected_protocol:
+        raise ValueError(
+            f"cloud did not acknowledge {expected_protocol} (returned {protocol!r})"
+        )
+    if protocol == PROTOCOL_VERSION_MM:
+        value = validate_mm_abi_header(mm_abi)
+        if expected_mm_abi is None:
+            raise ValueError(
+                f"{PROTOCOL_VERSION_MM} requires a locally computed "
+                f"{HEADER_MM_ABI} fingerprint on the cloud"
+            )
+        if enforce_mm_abi_match and value != expected_mm_abi:
+            raise ValueError(f"{HEADER_MM_ABI} fingerprint does not match this cloud")
+        return expected_mm_abi
+    if mm_abi is not None:
+        raise ValueError(f"{HEADER_MM_ABI} requires protocol {PROTOCOL_VERSION_MM}")
+    return None
 
 
 def compute_processor_fingerprint(model_config: Any) -> bytes:

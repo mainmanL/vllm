@@ -26,25 +26,25 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
         },
     }
     path = tmp_path / "topology.yaml"
-    path.write_text(yaml.safe_dump(raw))
     key = tmp_path / "tenant.key"
     key.write_text("local-key-content-must-not-be-logged")
     coordination: dict[str, Any] = {"enabled": True}
     if role == "edge":
         coordination.update(
-            control_url="http://10.1.0.1:9133/v1/chat/completions",
             tenant_key_file=str(key),
             consumer_id="enterprise-a-edge1",
             connect_timeout=5.0,
         )
+        raw["edges"][identity]["coordination"] = coordination
     else:
-        coordination.update(listen_host="0.0.0.0", listen_port=9133)
+        coordination.update(listen_host="0.0.0.0")
+        raw["clouds"][identity]["coordination"] = coordination
+    path.write_text(yaml.safe_dump(raw))
     config = LwdConfig.from_dict(
         {
             "path": str(path),
             "role": role,
             "instance_id": identity,
-            "coordination": coordination,
         }
     )
     path.unlink()
@@ -62,21 +62,24 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
     )
     topology = actual["topology"]
     assert topology.pop("digest") == config.topology.digest
-    for edge in raw["edges"]:
-        for dp in edge["dp"]:
-            dp["ctrl_port"] = None  # Parsed edge DPs retain this unset default.
-    assert topology == raw  # Includes all peers, ranks, ports, features and links.
+    assert [(link["edge"], link["cloud"]) for link in topology["instance_links"]] == [
+        (0, 0),
+        (1, 0),
+    ]
+    assert topology["clouds"][0]["dp"][0]["coord_port"] == 8100
+    assert topology["clouds"][0]["dp"][0]["coord_url"] == "http://10.1.0.1:8100"
     parsed = actual["coordination"]
     assert all(parsed[name] == value for name, value in coordination.items())
     assert set(parsed) == {
         "enabled",
-        "control_url",
+        "placement_only",
         "tenant_key_file",
         "consumer_id",
         "listen_host",
-        "listen_port",
         "instance_id",
         "connect_timeout",
+        "probe_timeout",
+        "enforce_mm_abi_match",
     }
     assert parsed["instance_id"] == "cloud-0"
     assert result["cloud_cards"] == {"0": 8}
@@ -111,4 +114,9 @@ def test_log_includes_multi_instance_api_endpoint(
     assert "lwd_api_config" not in result
     assert result["lwd_config"]["api"][field] == "10.0.0.1:25100"
     assert result["lwd_config"]["coordination"] is None
-    assert [link["dp_idx"] for link in result["connections"]] == [0, 1]
+    assert [link["connection_id"]["dp_idx"] for link in result["connections"]] == [
+        0,
+        1,
+        0,
+        1,
+    ]

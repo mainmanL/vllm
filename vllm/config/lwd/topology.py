@@ -38,19 +38,40 @@ def _address(value: str) -> str:
     return str(address)
 
 
-def _validate_http_url(value: str | None) -> None:
-    if value is not None:
+def _reject_legacy_coordination_fields(raw: Any) -> Any:
+    if isinstance(raw, dict):
+        retired = {"control_url", "control_url_map", "listen_port"}.intersection(raw)
+        if retired:
+            names = ", ".join(sorted(retired))
+            raise ValueError(
+                f"[LWD] {names} are retired; configure cloud DP "
+                "coord_port/coord_url instead"
+            )
+    return raw
+
+
+def _validate_coord_url(value: str, coord_port: int | None) -> None:
+    if any(char.isspace() for char in value):
+        raise ValueError("[LWD] coord_url must not contain whitespace")
+    try:
         url = urlsplit(value)
-        if url.scheme not in ("http", "https") or not url.hostname:
-            raise ValueError("[LWD] control_url must be an HTTP(S) endpoint")
-
-
-def _validate_control_url_map(value: dict[int, str]) -> dict[int, str]:
-    for cloud_id, url in value.items():
-        if cloud_id < 0:
-            raise ValueError("[LWD] control_url_map keys must be non-negative")
-        _validate_http_url(url)
-    return value
+        port = url.port
+    except ValueError as exc:
+        raise ValueError(f"[LWD] invalid coord_url: {exc}") from exc
+    if url.scheme not in ("http", "https") or not url.hostname:
+        raise ValueError("[LWD] coord_url must be an HTTP(S) endpoint with a host")
+    try:
+        address = ip_address(url.hostname)
+    except ValueError:
+        # DNS names are supported for NAT, proxies and external gateways.
+        pass
+    else:
+        if address.is_unspecified or address.is_multicast:
+            raise ValueError("[LWD] coord_url host must be a routable endpoint")
+    if coord_port is None:
+        raise ValueError("[LWD] coord_url requires coord_port on the same DP")
+    if port is None or port < 1:
+        raise ValueError("[LWD] coord_url must include a valid explicit port")
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -174,14 +195,12 @@ class LwdCoordination:
 
     enabled: StrictBool = False
     # Edge-side fields
-    control_url: LwdString | None = None
-    control_url_map: dict[int, LwdString] = Field(default_factory=dict)
     placement_only: StrictBool = False
     tenant_key_file: LwdString | None = None
     consumer_id: LwdString | None = None
     # Cloud-side fields
     listen_host: LwdString = "0.0.0.0"
-    listen_port: LwdPort = 8100
+    probe_poll_budget: Annotated[int, Field(strict=True, gt=0)] = 32
     # Shared
     connect_timeout: Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)] = (
         10.0
@@ -193,25 +212,8 @@ class LwdCoordination:
 
     @model_validator(mode="before")
     @classmethod
-    def normalize_control_url(cls, raw: Any) -> Any:
-        if not isinstance(raw, dict) or not isinstance(raw.get("control_url"), dict):
-            return raw
-        if raw.get("control_url_map"):
-            raise ValueError(
-                "[LWD] control_url map and control_url_map are mutually exclusive"
-            )
-        return {**raw, "control_url": None, "control_url_map": raw["control_url"]}
-
-    @field_validator("control_url")
-    @classmethod
-    def validate_url(cls, value: str | None) -> str | None:
-        _validate_http_url(value)
-        return value
-
-    @field_validator("control_url_map")
-    @classmethod
-    def validate_url_map(cls, value: dict[int, str]) -> dict[int, str]:
-        return _validate_control_url_map(value)
+    def reject_legacy_fields(cls, raw: Any) -> Any:
+        return _reject_legacy_coordination_fields(raw)
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -223,6 +225,23 @@ class LwdDP:
     ``device``; omitted in host comm, where no global comm domain exists."""
     ctrl_port: LwdPort | None = None
     data_port: LwdPort | None = None
+    coord_port: LwdPort | None = None
+    coord_url: LwdString | None = None
+    """Advertised HTTP coordination endpoint; derived from addr/coord_port
+    when omitted. Explicit URLs support DNS, NAT and gateways whose external
+    port differs from coord_port; multiple DPs may share a gateway URL."""
+
+    @model_validator(mode="after")
+    def normalize_coord_url(self) -> "LwdDP":
+        if self.coord_url is None:
+            if self.coord_port is not None:
+                host = f"[{self.addr}]" if ":" in self.addr else self.addr
+                object.__setattr__(
+                    self, "coord_url", f"http://{host}:{self.coord_port}"
+                )
+        else:
+            _validate_coord_url(self.coord_url, self.coord_port)
+        return self
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -280,7 +299,7 @@ class LwdTopology:
     feature_ctrl: LwdFeatures
     edges: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
     clouds: Annotated[tuple[LwdInstance, ...], Field(min_length=1)]
-    instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)]
+    instance_links: Annotated[tuple[LwdLink, ...], Field(min_length=1)] | None = None
     qos: LwdQoS | None = None
     control_plane: LwdControlPlaneConfig = Field(default_factory=LwdControlPlaneConfig)
     digest: str = Field(default="", init=False)
@@ -298,6 +317,16 @@ class LwdTopology:
     @classmethod
     def from_dict(cls, raw: Any) -> "LwdTopology":
         topology = TypeAdapter(cls).validate_python(raw)
+        if topology.instance_links is None:
+            object.__setattr__(
+                topology,
+                "instance_links",
+                tuple(
+                    LwdLink(edge.id, cloud.id)
+                    for edge in topology.edges
+                    for cloud in topology.clouds
+                ),
+            )
         topology.validate_layout()
         # Hash the validated semantic snapshot, never YAML spelling/layout.
         # Exclude the derived digest field itself from the canonical payload.
@@ -410,16 +439,31 @@ class LwdTopology:
                 raise ValueError(f"[LWD] duplicate data_port on {addr}")
 
     def _validate_coordination(self) -> None:
-        """Validate the cloud ids every coordination block refers to."""
-        cloud_ids = {cloud.id for cloud in self.clouds}
-        for instance in (*self.edges, *self.clouds):
-            coordination = instance.coordination
-            if coordination is None:
+        """Require a complete advertised endpoint on every coordinated cloud DP."""
+        for cloud in self.clouds:
+            if cloud.coordination is not None and cloud.coordination.enabled:
+                for dp in cloud.dp:
+                    if dp.coord_port is None or dp.coord_url is None:
+                        raise ValueError(
+                            "[LWD] enabled cloud coordination requires "
+                            "coord_port on every DP"
+                        )
+        for edge in self.edges:
+            if edge.coordination is None or not edge.coordination.enabled:
                 continue
-            unknown = set(coordination.control_url_map) - cloud_ids
-            if unknown:
+            linked_clouds = (
+                self.clouds[link.cloud]
+                for link in self.instance_links
+                if link.edge == edge.id
+            )
+            if any(
+                dp.coord_port is None or dp.coord_url is None
+                for cloud in linked_clouds
+                for dp in cloud.dp
+            ):
                 raise ValueError(
-                    f"[LWD] control_url_map references unknown clouds {sorted(unknown)}"
+                    "[LWD] enabled edge coordination requires coord_port "
+                    "on every linked cloud DP"
                 )
 
     def _validate_ranks(self) -> None:
@@ -486,6 +530,38 @@ class LwdTopology:
                 "[LWD] Cloud DPs on the same address must use "
                 "different ctrl_port values"
             )
+        if self.deployment.scene == "edge_share":
+            for cloud_dps in zip(*(cloud.dp for cloud in self.clouds)):
+                if (
+                    len({dp.addr for dp in cloud_dps}) == len(cloud_dps)
+                    and len({dp.ctrl_port for dp in cloud_dps}) != 1
+                ):
+                    raise ValueError(
+                        "[LWD] edge_share clouds on distinct addresses must use "
+                        "the same ctrl_port per DP"
+                    )
+        coord_ports = [
+            (dp.addr, dp.coord_port) for dp in dps if dp.coord_port is not None
+        ]
+        if len(set(coord_ports)) != len(coord_ports):
+            raise ValueError(
+                "[LWD] Cloud DPs on the same address must use "
+                "different coord_port values"
+            )
+        listeners = {
+            (dp.addr, port): f"{kind}_port"
+            for dp in dps
+            for kind, port in (("ctrl", dp.ctrl_port), ("data", dp.data_port))
+            if port is not None
+        }
+        for dp in dps:
+            if dp.coord_port is None:
+                continue
+            conflict = listeners.get((dp.addr, dp.coord_port))
+            if conflict is not None:
+                raise ValueError(
+                    f"[LWD] coord_port conflicts with {conflict} on {dp.addr}"
+                )
 
     def _validate_scene(self) -> None:
         """Validate logical instance shape, independently of physical host count."""

@@ -1,54 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Health-aware round-robin selection for direct multi-cloud LWD links."""
+"""Health-aware round-robin selection for direct cloud DP links."""
 
 from __future__ import annotations
 
 import time
 
+LwdCloudDpId = tuple[int, int]
+
 
 class LwdCloudHealthTracker:
-    """Track probe health without changing existing request bindings."""
+    """Track DP health without changing existing request bindings."""
 
-    def __init__(self, cloud_ids: list[int] | tuple[int, ...]) -> None:
-        self._cloud_ids = tuple(sorted(cloud_ids))
-        self._failures = dict.fromkeys(self._cloud_ids, 0)
-        self._cooldown_until: dict[int, float] = {}
+    def __init__(self, targets: tuple[LwdCloudDpId, ...]) -> None:
+        self._targets = tuple(sorted(set(targets)))
+        self._failures = dict.fromkeys(self._targets, 0)
+        self._cooldown_until: dict[LwdCloudDpId, float] = {}
         self._cursor = 0
 
-    def candidates(self, now: float | None = None) -> tuple[int, ...]:
+    def candidates(self, now: float | None = None) -> tuple[LwdCloudDpId, ...]:
         now = time.monotonic() if now is None else now
         healthy = tuple(
-            cloud_id
-            for cloud_id in self._cloud_ids
-            if self._cooldown_until.get(cloud_id, 0.0) <= now
+            target
+            for target in self._targets
+            if self._cooldown_until.get(target, 0.0) <= now
         )
-        # Fail open when every direct candidate is cooling down. Existing
-        # request routes are owned by the scheduler and are never rewritten.
-        return healthy or self._cloud_ids
+        return healthy or self._targets
 
-    def next(self) -> int | None:
+    def next(self, allowed: set[LwdCloudDpId] | None = None) -> LwdCloudDpId | None:
         candidates = self.candidates()
+        if allowed is not None:
+            candidates = tuple(target for target in candidates if target in allowed)
         if not candidates:
             return None
-        cloud_id = candidates[self._cursor % len(candidates)]
+        target = candidates[self._cursor % len(candidates)]
         self._cursor += 1
-        return cloud_id
+        return target
 
-    def record_success(self, cloud_id: int) -> None:
-        self._failures[cloud_id] = 0
-        self._cooldown_until.pop(cloud_id, None)
+    def record_success(self, target: LwdCloudDpId) -> None:
+        self._failures[target] = 0
+        self._cooldown_until.pop(target, None)
 
     def record_failure(
         self,
-        cloud_id: int,
+        target: LwdCloudDpId,
         *,
         now: float | None = None,
         threshold: int = 3,
         cooldown_s: float = 60.0,
     ) -> None:
         now = time.monotonic() if now is None else now
-        failures = self._failures.get(cloud_id, 0) + 1
-        self._failures[cloud_id] = failures
+        failures = self._failures.get(target, 0) + 1
+        self._failures[target] = failures
         if failures >= threshold:
-            self._cooldown_until[cloud_id] = now + cooldown_s
+            self._cooldown_until[target] = now + cooldown_s

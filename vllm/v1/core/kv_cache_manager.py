@@ -297,8 +297,11 @@ class KVCacheManager:
             reservations = getattr(self, "lwd_prefix_reservations", None)
             if reservations is None:
                 raise RuntimeError("LWD prefix reservations are not initialized")
-            computed_blocks, num_new_computed_tokens = reservations.snapshot(request)
-            shared_prefix_boundary = 0
+            (
+                computed_blocks,
+                num_new_computed_tokens,
+                shared_prefix_boundary,
+            ) = reservations.snapshot(request)
         else:
             computed_blocks, num_new_computed_tokens, num_uncached = (
                 self.coordinator.find_longest_cache_hit(

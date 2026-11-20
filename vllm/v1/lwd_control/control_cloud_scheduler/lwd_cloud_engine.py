@@ -246,7 +246,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             )
 
             self._lwd_control_processor = LwdCloudControlProcessor(
-                self._lwd_coord_pending, self.cloud_control_event_queue
+                self._lwd_coord_pending,
+                self.cloud_control_event_queue,
+                poll_budget=coordination.probe_poll_budget,
             )
             threading.Thread(
                 target=self._lwd_coord_wake_loop,
@@ -365,16 +367,30 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             prefix_nonce,
         )
 
+    def _lwd_publish_usage_start(self, request: Request) -> None:
+        event_queue = getattr(self, "cloud_control_event_queue", None)
+        if event_queue is None:
+            return
+        event_queue.put(
+            {
+                "type": "usage_start",
+                "request_id": request.request_id,
+                "engine_index": self._lwd_engine_index,
+                "prefix_nonce": getattr(request, "lwd_prefix_nonce", 0),
+            }
+        )
+
     def add_request(self, request: Request, request_wave: int = 0) -> None:
         nonce = getattr(request, "lwd_prefix_nonce", 0)
-        if not nonce:
-            if self._lwd_prefix_enabled:
-                lwd_logger.error(
-                    "[LWD][prefix] reject req=%s: missing prefix nonce",
-                    request.request_id,
-                )
-                return
+        if not self._lwd_prefix_enabled:
             super().add_request(request, request_wave)
+            self._lwd_publish_usage_start(request)
+            return
+        if not nonce:
+            lwd_logger.error(
+                "[LWD][prefix] reject req=%s: missing prefix nonce",
+                request.request_id,
+            )
             return
 
         request_id = request.request_id
@@ -411,6 +427,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 request_id, 0, nonce, error="cloud admission failed"
             )
             raise
+        self._lwd_publish_usage_start(request)
         self._lwd_ledger.prefix_hits[request_id] = hit_tokens
         self._lwd_send_prefix_ready(request_id, hit_tokens, nonce)
 
@@ -750,7 +767,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             self, "cloud_control_processor", self._lwd_control_processor
         )
         if processor is not None:
-            processor.poll(probe_query)
+            consumed = processor.poll(probe_query)
+            if consumed and not self._lwd_coord_pending.empty():
+                self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
 
     def has_work(self) -> bool:
         # Native WAKEUP reevaluates this predicate even when the scheduler is
@@ -785,7 +804,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         )
         from vllm.v1.lwd_control.lwd_comm.lwd_prefix import LwdUsage
 
-        for request_id, (prompt_tokens, completion_tokens) in list(records.items()):
+        for request_id, (prompt_tokens, completion_tokens, prefix_nonce) in list(
+            records.items()
+        ):
             cached_tokens = self._lwd_ledger.prefix_hits.get(request_id, 0)
             usage = LwdUsage(
                 prompt_tokens=prompt_tokens,
@@ -799,6 +820,7 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                         "request_id": request_id,
                         "usage": usage,
                         "engine_index": self._lwd_engine_index,
+                        "prefix_nonce": prefix_nonce,
                     }
                 )
             records.pop(request_id, None)

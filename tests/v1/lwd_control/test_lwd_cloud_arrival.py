@@ -310,6 +310,7 @@ def test_abort_records_drop_and_preserves_native_iterable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request()
+    request.lwd_prefix_nonce = 7
     scheduler = _scheduler(request)
     received = []
 
@@ -327,6 +328,7 @@ def test_abort_records_drop_and_preserves_native_iterable(
     assert scheduler._lwd_dropped == {"p"}
     assert scheduler._lwd_abort_pending == ["p"]
     assert received == [(("p",), RequestStatus.FINISHED_ABORTED)]
+    assert scheduler.lwd_finished_records == {}
 
 
 def test_abort_only_embed_and_non_embed_retry_do_not_lose_notice() -> None:
@@ -740,7 +742,8 @@ def test_free_request_cleans_prefix_reservation_and_refill_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request()
-    scheduler = _visible_set_scheduler([request], [])
+    request.lwd_prefix_nonce = 11
+    scheduler = _scheduler(request)
     scheduler.lwd_prefix_reservations = Mock()
     scheduler._lwd_refill_gate = {"p"}
     scheduler._lwd_refill_pending = {"p": 16}
@@ -754,3 +757,22 @@ def test_free_request_cleans_prefix_reservation_and_refill_gate(
     scheduler.lwd_prefix_reservations.release.assert_called_once_with("p")
     assert scheduler._lwd_refill_gate == set()
     assert scheduler._lwd_refill_pending == {}
+    assert scheduler.lwd_finished_records["p"] == (10, 0, 11)
+
+
+def test_publish_finished_usage_keeps_snapshot_nonce() -> None:
+    engine = _engine()
+    engine.scheduler.lwd_finished_records = {"p": (16, 3, 7)}
+    engine.cloud_control_event_queue = queue.Queue()
+    engine._lwd_engine_index = 1
+    engine._lwd_ledger.prefix_hits["p"] = 16
+
+    engine._lwd_publish_finished_usage(None)
+
+    event = engine.cloud_control_event_queue.get_nowait()
+    assert event["type"] == "usage"
+    assert event["request_id"] == "p"
+    assert event["engine_index"] == 1
+    assert event["prefix_nonce"] == 7
+    assert event["usage"].cached_tokens == 16
+    assert engine.scheduler.lwd_finished_records == {}

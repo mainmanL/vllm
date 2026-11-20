@@ -47,13 +47,22 @@ def _edge_instances(scene: str, value: str, cloud_count: int) -> list[tuple[int,
 
 
 def _instance(
-    identity: int, address: str, ranks: list[list[int]], port_base: int | None = None
+    identity: int,
+    address: str,
+    ranks: list[list[int]],
+    port_base: int | None = None,
+    coord_port_base: int | None = None,
 ) -> dict[str, Any]:
     dps = []
     for index, group in enumerate(ranks):
         item: dict[str, Any] = {"dp_idx": index, "addr": address, "ranks": group}
         if port_base is not None:
             item["ctrl_port"] = port_base + index
+        if coord_port_base is not None:
+            coord_port = coord_port_base + index
+            item["coord_port"] = coord_port
+            host = f"[{address}]" if ":" in address else address
+            item["coord_url"] = f"http://{host}:{coord_port}"
         dps.append(item)
     return {"id": identity, "dp": dps}
 
@@ -63,11 +72,11 @@ def _cloud_layout(
     dp: int,
     edge_rank_count: int,
     port_base: int,
-    *,
-    shared_ports: bool = False,
+    coord_port_base: int,
 ) -> list[dict[str, Any]]:
     next_rank = edge_rank_count
     next_ports: dict[str, int] = {}
+    next_coord_ports: dict[str, int] = {}
     clouds = []
     for identity, address, cards in instances:
         per_dp = cards // dp
@@ -76,11 +85,13 @@ def _cloud_layout(
             for start in range(next_rank, next_rank + cards, per_dp)
         ]
         port = next_ports.get(address, port_base)
-        clouds.append(_instance(identity, address, ranks, port))
+        coord_port = next_coord_ports.get(address, coord_port_base)
+        clouds.append(_instance(identity, address, ranks, port, coord_port))
         next_rank += cards
-        # edge_share reuses edge-side channels; other scenes bind per cloud DP.
-        if not shared_ports:
-            next_ports[address] = port + dp
+        # Ports may repeat on different hosts, but colocated cloud DPs need
+        # independent listeners even when edge_share reuses edge channels.
+        next_ports[address] = port + dp
+        next_coord_ports[address] = coord_port + dp
     return clouds
 
 
@@ -117,11 +128,10 @@ def build_topology(
     *,
     cloud_cards: str,
     tenant_key_file: str = "/run/secrets/edge-cloud-tenant-key",
-    consumer_ids: str = "enterprise-a",
+    consumer_ids: str | None = None,
     connect_timeout: float = 5.0,
     listen_host: str = "0.0.0.0",
-    listen_port: int = 8100,
-    control_url: str | None = None,
+    coord_port_base: int = 8100,
 ) -> dict[str, Any]:
     """Allocate global ranks; host-local physical devices remain launch settings."""
     if scene not in SCENES:
@@ -130,6 +140,8 @@ def build_topology(
         raise ValueError("DP must be one positive integer")
     if not 1 <= port_base <= 65535 - dp + 1:
         raise ValueError("All generated control ports must be within 1..65535")
+    if not 1 <= coord_port_base <= 65535 - dp + 1:
+        raise ValueError("All generated coordination ports must be within 1..65535")
     if scene == "edge_share" and "@" not in cloud_machines:
         raise ValueError("edge_share requires --cloud-machines ID@IP entries")
     cloud_instances = _cloud_instances(cloud_machines, cloud_cards, dp)
@@ -142,7 +154,11 @@ def build_topology(
     # Distinct cloud-reuse instances retain distinct ranks on the same host.
     edge_rank_count = 1 if shared else len(edges)
     clouds = _cloud_layout(
-        cloud_instances, dp, edge_rank_count, port_base, shared_ports=shared
+        cloud_instances,
+        dp,
+        edge_rank_count,
+        port_base,
+        coord_port_base,
     )
     links = (
         [{"edge": edge["id"], "cloud": edge["id"]} for edge in edges]
@@ -167,35 +183,33 @@ def build_topology(
         },
         "edges": edges,
         "clouds": clouds,
-        "instance_links": links,
     }
-    if scene == "cloud_share":
-        # Parse consumer_ids into a list, one per edge instance.
-        consumer_id_list = [cid.strip() for cid in consumer_ids.split(",")]
-        if len(consumer_id_list) != len(edges):
+    if shared:
+        # Full-mesh links are derived by the schema; edge_share stays explicit.
+        result["instance_links"] = links
+    if scene in ("cloud_share", "lwd_cluster"):
+        consumer_id_list = (
+            ["enterprise-a"] * len(edges)
+            if consumer_ids is None
+            else [cid.strip() for cid in consumer_ids.split(",")]
+        )
+        if scene == "cloud_share" and len(consumer_id_list) != len(edges):
             raise ValueError(
                 f"--consumer-ids count ({len(consumer_id_list)}) must match "
                 f"edge instance count ({len(edges)})"
             )
-        # control_url: use user-provided value, or auto-derive from cloud IP + port.
-        if control_url is None:
-            cloud_ip = cloud_instances[0][1]
-            control_url = f"http://{cloud_ip}:{listen_port}/v1/chat/completions"
-        # Embed coordination into each edge instance (edge-side fields).
         for i, edge in enumerate(edges):
             edge["coordination"] = {
                 "enabled": True,
-                "control_url": control_url,
                 "tenant_key_file": tenant_key_file,
-                "consumer_id": consumer_id_list[i],
                 "connect_timeout": connect_timeout,
             }
-        # Embed coordination into each cloud instance (cloud-side fields).
+            if scene == "cloud_share":
+                edge["coordination"]["consumer_id"] = consumer_id_list[i]
         for cloud in clouds:
             cloud["coordination"] = {
                 "enabled": True,
                 "listen_host": listen_host,
-                "listen_port": listen_port,
             }
     return result
 
@@ -219,6 +233,12 @@ def main() -> None:
         "--dp", type=int, default=1, help="Must divide each cloud card count"
     )
     parser.add_argument("--port-base", type=int, default=5550)
+    parser.add_argument(
+        "--coord-port-base",
+        type=int,
+        default=8100,
+        help="First per-DP HTTP coordination port",
+    )
     parser.add_argument("--enable-early-recv", action="store_true")
     parser.add_argument("--enable-scramble", action="store_true")
     parser.add_argument(
@@ -238,32 +258,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--consumer-ids",
-        default="enterprise-a",
-        help="cloud_share only: comma-separated consumer IDs, one per edge instance",
-    )
-    parser.add_argument(
-        "--control-url",
         default=None,
-        help=(
-            "cloud_share only: edge->cloud control service URL; auto-derived if omitted"
-        ),
+        help="cloud_share only: comma-separated consumer IDs, one per edge instance",
     )
     parser.add_argument(
         "--connect-timeout",
         type=float,
         default=5.0,
-        help="cloud_share only: edge->cloud control connection timeout (seconds)",
+        help="cloud_share/lwd_cluster: edge->cloud coordination timeout (seconds)",
     )
     parser.add_argument(
         "--listen-host",
         default="0.0.0.0",
-        help="cloud_share only: cloud-side coordination service listen host",
-    )
-    parser.add_argument(
-        "--listen-port",
-        type=int,
-        default=8100,
-        help="cloud_share only: cloud-side coordination service listen port",
+        help="cloud_share/lwd_cluster: cloud DP coordination listen host",
     )
     parser.add_argument(
         "-o", "--output", type=Path, required=True, help="One output YAML file"
@@ -279,10 +286,9 @@ def main() -> None:
             cloud_cards=args.cloud_cards,
             tenant_key_file=args.tenant_key_file,
             consumer_ids=args.consumer_ids,
-            control_url=args.control_url,
             connect_timeout=args.connect_timeout,
             listen_host=args.listen_host,
-            listen_port=args.listen_port,
+            coord_port_base=args.coord_port_base,
         )
         raw["feature_ctrl"] = {
             "enable_early_recv": args.enable_early_recv,

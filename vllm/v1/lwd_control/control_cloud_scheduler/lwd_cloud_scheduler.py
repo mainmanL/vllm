@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -79,30 +79,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
     """Mix all decode requests with prefill windows whose rows have arrived."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        # LWD keeps every real Mamba checkpoint until the native mapping from
-        # state blocks to prefix boundaries supports sparse retention safely.
-        if len(args) > 1:
-            kv_cache_config = args[1]
-            if kv_cache_config.prefix_cache_retention_interval is not None:
-                lwd_logger.info(
-                    "[prefix] LWD uses dense Mamba checkpoints; override "
-                    "retention_interval=%s -> None",
-                    kv_cache_config.prefix_cache_retention_interval,
-                )
-                kv_cache_config = replace(
-                    kv_cache_config, prefix_cache_retention_interval=None
-                )
-                args = (args[0], kv_cache_config, *args[2:])
-        elif kwargs["kv_cache_config"].prefix_cache_retention_interval is not None:
-            previous = kwargs["kv_cache_config"].prefix_cache_retention_interval
-            lwd_logger.info(
-                "[prefix] LWD uses dense Mamba checkpoints; override "
-                "retention_interval=%s -> None",
-                previous,
-            )
-            kwargs["kv_cache_config"] = replace(
-                kwargs["kv_cache_config"], prefix_cache_retention_interval=None
-            )
         super().__init__(*args, **kwargs)
         self.lwd_recv_rows: dict[str, int] = {}
         self._lwd_dropped: set[str] = set()
@@ -115,7 +91,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
         self._lwd_prefill_group_cursor = 0
-        self.lwd_finished_records: dict[str, tuple[int, int]] = {}
+        self.lwd_finished_records: dict[str, tuple[int, int, int]] = {}
         self.lwd_hash_block_size = 0
         self.lwd_prefix_hits: dict[str, int] = {}
         self.lwd_refill_sender = None
@@ -194,13 +170,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
         if request.skip_reading_prefix_cache:
             groups, h_prime = (), 0
+            shared_prefix_boundary = 0
         else:
-            groups, h_prime, _ = (
+            groups, h_prime, uncached = (
                 self.kv_cache_manager.coordinator.find_longest_cache_hit(
                     request.block_hashes,
                     max_cache_hit_length=max(0, request.num_prompt_tokens - 1),
                 )
             )
+            shared_prefix_boundary = h_prime + uncached if uncached else 0
 
         recv_rows = self.lwd_recv_rows.get(request.request_id, 0)
         # Same alignment the probe path lands hits on (compressed-state
@@ -213,7 +191,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
             groups = reservations.truncate(groups, clamped_hit)
             h_prime = clamped_hit
 
-        reservations.reserve_hit(request, groups, h_prime)
+        reservations.reserve_hit(request, groups, h_prime, shared_prefix_boundary)
         if h_prime >= floor:
             return True
 
@@ -398,13 +376,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
             request_ids = (request_ids,)
         else:
             request_ids = tuple(request_ids)
-        for request_id in request_ids:
-            request = self.requests.get(request_id)
-            if request is not None:
-                self.lwd_finished_records[request_id] = (
-                    request.num_prompt_tokens,
-                    request.num_output_tokens,
-                )
         if finished_status == RequestStatus.FINISHED_ABORTED:
             for request_id in request_ids:
                 self._lwd_drop_request(request_id)

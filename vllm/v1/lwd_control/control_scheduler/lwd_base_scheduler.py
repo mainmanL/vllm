@@ -194,6 +194,7 @@ class LwdBaseScheduler(AsyncScheduler):
             records[request.request_id] = (
                 request.num_prompt_tokens,
                 request.num_tokens - request.num_prompt_tokens,
+                getattr(request, "lwd_prefix_nonce", 0),
             )
             if len(records) > 1024:
                 for stale in list(records)[:256]:

@@ -68,6 +68,11 @@ def test_explicit_colocated_ids_generate_independent_ranks(tmp_path: Path) -> No
         [[1], [1]],
     ]
     assert [d["ctrl_port"] for d in raw["clouds"][0]["dp"]] == [15783, 15784]
+    assert [d["coord_port"] for d in raw["clouds"][0]["dp"]] == [8100, 8101]
+    assert [d["coord_url"] for d in raw["clouds"][0]["dp"]] == [
+        "http://76.76.26.232:8100",
+        "http://76.76.26.232:8101",
+    ]
     assert raw["deployment"]["hccl_world_size"] == 10
 
 
@@ -116,9 +121,14 @@ def test_edge_share_allocates_explicit_cards_per_instance(
     raw = yaml.safe_load(output.read_text())
     assert raw["deployment"]["hccl_world_size"] == world
     assert [[d["ranks"] for d in c["dp"]] for c in raw["clouds"]] == expected_ranks
-    assert [[d["ctrl_port"] for d in c["dp"]] for c in raw["clouds"]] == [
-        list(range(6020, 6020 + dp))
-    ] * 2
+    for address in {cloud["dp"][0]["addr"] for cloud in raw["clouds"]}:
+        ports = [
+            dp["ctrl_port"]
+            for cloud in raw["clouds"]
+            for dp in cloud["dp"]
+            if dp["addr"] == address
+        ]
+        assert ports == list(range(6020, 6020 + len(ports)))
     assert {tuple(d["ranks"]) for e in raw["edges"] for d in e["dp"]} == {(0,)}
     assert raw["instance_links"] == [{"edge": 0, "cloud": 0}, {"edge": 1, "cloud": 1}]
 
@@ -245,6 +255,7 @@ _SCENE_INPUTS = {
         ),
         ("edge_share", {"dp": 8}, "divisible"),
         ("edge_share", {"dp": 2, "port_base": 65535}, "within 1..65535"),
+        ("edge_share", {"dp": 2, "coord_port_base": 65535}, "within 1..65535"),
         ("single_instance", {"cloud_cards": None}, "required"),
         ("single_instance", {"cloud_cards": "0:0"}, "positive"),
         ("single_instance", {"cloud_cards": "0:-1"}, "ID:count"),
@@ -286,3 +297,43 @@ def test_rejected_input_preserves_existing_yaml(
     assert result.returncode != 0
     assert match in result.stderr
     assert output.read_text() == "keep existing yaml\n"
+
+
+@pytest.mark.parametrize("flag", ["control_url", "listen_port"])
+def test_retired_instance_coordination_cli_is_rejected(
+    tmp_path: Path, flag: str
+) -> None:
+    output = tmp_path / "topology.yaml"
+    result = generate(
+        output,
+        scene="single_instance",
+        edge_machines="10.0.0.1",
+        cloud_machines="10.1.0.1",
+        cloud_cards="0:8",
+        **{flag: "http://10.1.0.1:8100" if flag == "control_url" else 8100},
+    )
+    assert result.returncode != 0
+    assert "unrecognized arguments" in result.stderr
+    assert not output.exists()
+
+
+def test_custom_coord_port_base_generates_complete_ipv6_endpoints(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "topology.yaml"
+    result = generate(
+        output,
+        scene="single_instance",
+        edge_machines="10.0.0.1",
+        cloud_machines="2001:db8::1",
+        cloud_cards="0:8",
+        dp=2,
+        coord_port_base=9200,
+    )
+    assert result.returncode == 0, result.stderr
+    topology = LwdTopology.from_file(str(output))
+    assert [dp.coord_port for dp in topology.clouds[0].dp] == [9200, 9201]
+    assert [dp.coord_url for dp in topology.clouds[0].dp] == [
+        "http://[2001:db8::1]:9200",
+        "http://[2001:db8::1]:9201",
+    ]

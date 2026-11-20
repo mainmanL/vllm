@@ -5,9 +5,11 @@
 each cloud's scheduling limits and the request entry (edge admission +
 announcement to the routed cloud DP rank; communication stays in the engine).
 
-Stepping is the native step_with_batch_queue, adapted at construction: depth
-2, is_pooling_model=True (no native sample_tokens) and an executor proxy (a
-normally completed batch returning None becomes a placeholder).
+Stepping is the native step_with_batch_queue, adapted at construction: host
+comm sizes the queue for dynamic scale-out (max instances x 2 slots), device
+comm keeps the depth-2 native baseline; is_pooling_model=True (no native
+sample_tokens) and an executor proxy (a normally completed batch returning
+None becomes a placeholder).
 
 Startup blocks until every cloud DP rank accepted the handshake and sent its
 scheduling limits, within one handshake timeout; any failure stops the
@@ -66,6 +68,15 @@ from vllm.v1.request import Request
 # reaped. 2 keeps the pipeline aligned; the reference branch's 4 is
 # conservative, validate performance with 2 first.
 LWD_EDGE_BATCH_QUEUE_DEPTH = 2
+# Host comm (UCX) scales the instance count dynamically, so the queue is
+# sized once for the maximum deployment instead of the assembly-time
+# connection count: LWD_EDGE_HOST_MAX_INSTANCES x slots. 2 slots is the
+# per-connection
+# end-to-end window (the cloud's early-recv pump caps in-flight UP chunks
+# per connection at 2); deeper per-connection queuing only accumulates
+# behind its backpressure.
+LWD_EDGE_HOST_MAX_INSTANCES = 4
+LWD_EDGE_HOST_SLOTS_PER_INSTANCE = 2
 LWD_PREFIX_READY_TIMEOUT_S = 60.0
 
 # A full outbound queue is retried with growing intervals (about 3 s in
@@ -132,13 +143,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         }
         for dp_idx, params in self._lwd_cloud_params.items():
             if params.prefix_hash_block_size > 0:
-                self._lwd_probe_manager._hash_sizes[dp_idx.cloud_id] = (
-                    params.prefix_hash_block_size
-                )
+                self._lwd_probe_manager._hash_sizes[
+                    (dp_idx.cloud_id, dp_idx.dp_idx)
+                ] = params.prefix_hash_block_size
         self.scheduler.lwd_send_to_cloud = self._lwd_send_to_cloud
         self.scheduler.lwd_refill_abort = self._lwd_abort_refill
         self.is_pooling_model = True
-        self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
+        if self.lwd_config.topology.is_host_comm:
+            # Host comm scales instances dynamically, so size for the
+            # maximum once (see LWD_EDGE_HOST_MAX_INSTANCES); the queue
+            # survives scale-out without re-assembly.
+            self.batch_queue_size = (
+                LWD_EDGE_HOST_MAX_INSTANCES * LWD_EDGE_HOST_SLOTS_PER_INSTANCE
+            )
+        else:
+            self.batch_queue_size = LWD_EDGE_BATCH_QUEUE_DEPTH
         self.batch_queue = deque(maxlen=self.batch_queue_size)
         self.step_fn = self.step_with_batch_queue
         self.model_executor = LwdEdgeExecutorProxy(self.model_executor)
@@ -289,13 +308,17 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         request: Request,
         preferred: LwdConnectionId | None = None,
     ) -> None:
-        dp_idx = self.scheduler.lwd_admit_request(request, preferred)
-        client = self._lwd_coord_clients.get(dp_idx)
         try:
+            dp_idx = self.scheduler.lwd_admit_request(request, preferred)
+            client = self._lwd_coord_clients.get(dp_idx)
             if client is not None:
                 client.send_first_req()
             self._lwd_notify_request(dp_idx, request)
+            self._lwd_probe_manager.mark_admitted(
+                request.request_id, getattr(request, "lwd_prefix_nonce", 0)
+            )
         except Exception:
+            self._lwd_probe_manager.abort(request.request_id)
             self.scheduler.lwd_edge_cancel_admission(request.request_id)
             raise
 
@@ -340,12 +363,18 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         completion: LwdProbeCompletion | None = None,
     ) -> None:
         preferred = self._lwd_preferred_connection(completion)
+        if completion is not None:
+            request.lwd_prefix_nonce = completion.probe_nonce
         request.lwd_prefix_probe_succeeded = False
         if completion is not None and completion.chain is not None:
             self._lwd_probe_chains[request.request_id] = completion.chain
         if completion is not None and completion.result is not None:
             coordination = self.lwd_config.coordination
-            placement_only = coordination is not None and coordination.placement_only
+            placement_only = (
+                (coordination is not None and coordination.placement_only)
+                or not self._lwd_prefix_enabled
+                or request.skip_reading_prefix_cache
+            )
             request.lwd_prefix_probe_succeeded = not placement_only
             hit = 0 if placement_only else completion.result.hit_tokens
             hit = min(max(hit, 0), max(request.num_prompt_tokens - 1, 0))
@@ -361,25 +390,52 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_preferred_connection(
         self, completion: LwdProbeCompletion | None
     ) -> LwdConnectionId | None:
-        if completion is None or completion.result is None:
+        if completion is None or not completion.activated:
             return None
-        cloud_id = completion.cloud_id
-        engine = completion.engine_index
-        if engine is not None:
-            candidate = LwdConnectionId(self.lwd_config.instance_id, cloud_id, engine)
-            if candidate in self._lwd_clouds:
-                return candidate
-        return next(
-            (
-                connection_id
-                for connection_id in sorted(self._lwd_clouds)
-                if connection_id.cloud_id == cloud_id
-            ),
-            None,
-        )
+        return completion.connection_id
 
     def _lwd_drain_probe_completions(self) -> None:
         for completion in self._lwd_probe_manager.drain():
+            if not completion.activated:
+                if not completion.candidates:
+                    lwd_logger.warning(
+                        "[edge-probe] all candidates failed req=%s targets=%s; "
+                        "using full prefill",
+                        completion.request.request_id,
+                        completion.failed_targets,
+                    )
+                hits = {
+                    candidate.connection_id: candidate.normalized_hit_tokens(
+                        completion.request.num_prompt_tokens
+                    )
+                    for candidate in completion.candidates
+                }
+                target = self.scheduler.lwd_select_probe_target(
+                    completion.request, hits
+                )
+                candidate = next(
+                    (
+                        item
+                        for item in completion.candidates
+                        if item.connection_id == target
+                    ),
+                    None,
+                )
+                if not self._lwd_probe_manager.activate(completion, target, candidate):
+                    lwd_logger.warning(
+                        "[edge-probe] stale activation req=%s ignored",
+                        completion.request.request_id,
+                    )
+                continue
+            if completion.activation_error is not None:
+                lwd_logger.error(
+                    "[edge-probe] activate failed req=%s target=%s: %s",
+                    completion.request.request_id,
+                    completion.connection_id,
+                    completion.activation_error,
+                )
+                self._lwd_abort_internally(completion.request)
+                continue
             self._lwd_add_request_after_probe(completion.request, completion)
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:

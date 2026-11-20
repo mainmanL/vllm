@@ -19,7 +19,15 @@ def _instance(
                 "dp_idx": index,
                 "addr": address,
                 "ranks": group,
-                **({"ctrl_port": ports[index]} if ports is not None else {}),
+                **(
+                    {
+                        "ctrl_port": ports[index],
+                        "coord_port": 8100 + index,
+                        "coord_url": f"http://{address}:{8100 + index}",
+                    }
+                    if ports is not None
+                    else {}
+                ),
             }
             for index, group in enumerate(ranks)
         ],
@@ -33,7 +41,7 @@ def _payload(
     clouds: list[dict[str, Any]],
     links: list[tuple[int, int]],
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "deployment": {
             "mode": 0,
             "scene": scene,
@@ -47,8 +55,23 @@ def _payload(
         },
         "edges": edges,
         "clouds": clouds,
-        "instance_links": [{"edge": edge, "cloud": cloud} for edge, cloud in links],
     }
+    if scene == "edge_share":
+        payload["instance_links"] = [
+            {"edge": edge, "cloud": cloud} for edge, cloud in links
+        ]
+    if scene in ("cloud_share", "lwd_cluster"):
+        for edge in edges:
+            edge["coordination"] = {
+                "enabled": True,
+                "tenant_key_file": "/run/secrets/edge-cloud-tenant-key",
+                "connect_timeout": 5.0,
+            }
+            if scene == "cloud_share":
+                edge["coordination"]["consumer_id"] = "enterprise-a"
+        for cloud in clouds:
+            cloud["coordination"] = {"enabled": True, "listen_host": "0.0.0.0"}
+    return payload
 
 
 # Only repeated field names are assembled; ranks, ports and links stay explicit.
