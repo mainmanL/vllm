@@ -38,11 +38,9 @@ class LwdBaseTransferQueue:
     """One FIFO of pending requests for one connection, channel and op."""
 
     def __init__(
-        self, dp_idx: int | ConnectionId, channel_type: LwdChannelType, op: str
+        self, connection: ConnectionId, channel_type: LwdChannelType, op: str
     ) -> None:
-        self.connection = (
-            dp_idx if isinstance(dp_idx, ConnectionId) else ConnectionId(0, 0, dp_idx)
-        )
+        self.connection = connection
         self.dp_idx = self.connection.dp_idx
         self.channel_type = channel_type
         self.op = op

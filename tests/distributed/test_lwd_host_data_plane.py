@@ -8,7 +8,11 @@ import torch
 
 from vllm.distributed.lwd.host.lwd_host_transfer_queue import LwdHostTransferQueue
 from vllm.distributed.lwd.host.ucx_block_policy import resolve
-from vllm.distributed.lwd.lwd_types import LwdChannelType, LwdTransferRequest
+from vllm.distributed.lwd.lwd_types import (
+    ConnectionId,
+    LwdChannelType,
+    LwdTransferRequest,
+)
 
 
 def test_up_block_includes_engram_segments_for_deepseek_v41() -> None:
@@ -25,7 +29,9 @@ def test_up_block_includes_engram_segments_for_deepseek_v41() -> None:
 
 
 def test_gpu_host_queue_allocates_receive_buffers_on_cuda() -> None:
-    queue = LwdHostTransferQueue(0, LwdChannelType.DOWN, "recv", device="cuda")
+    queue = LwdHostTransferQueue(
+        ConnectionId(0, 0, 0), LwdChannelType.DOWN, "recv", device="cuda"
+    )
     submitted = {}
     io = SimpleNamespace(
         submit_recv=lambda *args, **kwargs: submitted.update(args=args, kwargs=kwargs)

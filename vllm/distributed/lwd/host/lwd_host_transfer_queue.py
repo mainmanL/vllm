@@ -46,13 +46,13 @@ class LwdHostTransferQueue(LwdBaseTransferQueue):
 
     def __init__(
         self,
-        dp_idx: int | ConnectionId,
+        connection: ConnectionId,
         channel_type: LwdChannelType,
         op: str,
         *,
         device: str,
     ) -> None:
-        super().__init__(dp_idx, channel_type, op)
+        super().__init__(connection, channel_type, op)
         self.device = device
 
     def skip_seqno(self, seqno: int) -> None:

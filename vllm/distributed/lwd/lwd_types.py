@@ -11,15 +11,13 @@ from vllm.config.lwd.topology import LwdConnectionId as ConnectionId
 
 
 def connection_from(metadata: Any) -> ConnectionId:
-    """Read canonical batch identity, falling back at the legacy boundary."""
+    """Read a canonical connection from batch metadata or a transfer request."""
     connection = getattr(metadata, "connection_id", None)
-    if connection is not None:
-        return connection
-    return ConnectionId(
-        getattr(metadata, "edge_id", 0),
-        getattr(metadata, "cloud_id", 0),
-        getattr(metadata, "dp_idx", 0),
-    )
+    if connection is None:
+        connection = getattr(metadata, "connection", None)
+    if not isinstance(connection, ConnectionId):
+        raise ValueError("[LWD] batch metadata requires a canonical connection_id")
+    return connection
 
 
 class LwdChannelType(enum.Enum):

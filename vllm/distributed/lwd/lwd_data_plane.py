@@ -91,14 +91,10 @@ class LwdDataPlane:
         self,
         channel_type: LwdChannelType,
         seqno: int,
+        connection_id: ConnectionId,
         op: str = "recv",
-        dp_idx: int = 0,
-        edge_id: int = 0,
-        cloud_id: int = 0,
-        connection_id: ConnectionId | None = None,
     ) -> None:
-        connection = connection_id or ConnectionId(edge_id, cloud_id, dp_idx)
-        key = (connection, channel_type, op)
+        key = (connection_id, channel_type, op)
         with self._lock:
             queue = self._queues.get(key)
             if queue is None:

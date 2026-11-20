@@ -172,11 +172,9 @@ class LwdEdgeGPUModelRunner(LwdBaseGPUModelRunner):
                 self._lwd_up_send_watermarks[connection] = seqno
 
     def _lwd_watermarked_output(
-        self, connection: ConnectionId | int | None = None
+        self, connection: ConnectionId | None = None
     ) -> ModelRunnerOutput:
         self._lwd_pop_completed_up_sends()
-        if isinstance(connection, int):
-            connection = ConnectionId(0, 0, connection)
         if connection is None:
             watermarks = {
                 known: self._lwd_up_send_watermarks.get(known, -1)

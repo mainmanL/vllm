@@ -6,7 +6,11 @@ import torch
 
 from vllm.distributed.lwd.lwd_transfer_future import LwdTransferFuture
 from vllm.distributed.lwd.lwd_transfer_queue import LwdBaseTransferQueue
-from vllm.distributed.lwd.lwd_types import LwdChannelType, LwdTransferRequest
+from vllm.distributed.lwd.lwd_types import (
+    ConnectionId,
+    LwdChannelType,
+    LwdTransferRequest,
+)
 from vllm.v1.lwd_comm.data_comm.ucx_channel import LwdHostDoneEvent
 
 
@@ -33,7 +37,7 @@ def _request(seqno: int) -> LwdTransferRequest:
 
 
 def test_out_of_order_request_is_bound_when_its_predecessor_arrives() -> None:
-    queue = _ImmediateQueue(0, LwdChannelType.UP, "recv")
+    queue = _ImmediateQueue(ConnectionId(0, 0, 0), LwdChannelType.UP, "recv")
     deferred = queue.submit(_request(1))
     assert not deferred.done()
 
@@ -45,7 +49,7 @@ def test_out_of_order_request_is_bound_when_its_predecessor_arrives() -> None:
 
 
 def test_skip_and_duplicate_seqnos_do_not_block_later_requests() -> None:
-    queue = _ImmediateQueue(0, LwdChannelType.UP, "recv")
+    queue = _ImmediateQueue(ConnectionId(0, 0, 0), LwdChannelType.UP, "recv")
     queue.skip_seqno(0)
 
     completed = queue.submit(_request(1))
