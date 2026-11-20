@@ -338,7 +338,13 @@ class CudaPlatformBase(Platform):
             raise ValueError("PCP does not support data parallelism on CUDA yet.")
 
         if parallel_config.worker_cls == "auto":
-            parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+            lwd_config = getattr(vllm_config, "lwd_config", None)
+            if lwd_config is not None and lwd_config.role == "edge":
+                parallel_config.worker_cls = (
+                    "vllm.v1.worker.lwd_edge.lwd_edge_worker.LwdEdgeWorker"
+                )
+            else:
+                parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
 
         scheduler_config = vllm_config.scheduler_config
         # Note: model_config may be None during testing

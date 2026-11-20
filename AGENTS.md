@@ -19,7 +19,8 @@ LWD (Layerwise Disaggregated) 是基于 vLLM v1 引擎的边云分布式推理�
   | `vllm/v1/lwd_control/control_cloud_scheduler/` | 云侧引擎与 arrival 驱动调度 (`LwdCloudEngineCore`, hint/W1/W2, mixed prefill/decode) |
   | `vllm/v1/lwd_control/control_edge_scheduler/` | 边侧引擎/调度/assemble (`LwdEdgeEngineCore`, RangeNotify, UP send watermark, abort 路由) |
   | `vllm/v1/lwd_control/control_communication/` | 边云 pub/sub 控制面通信 |
-  | `vllm/v1/lwd_comm/data_comm/` | host-host UCX 传输 (UHC1): `data_plane_comm=host` 时承载边云数据帧; 设备拷贝与 NPU 编排在 ascend 的 `lwd_data_plane/host/` |
+  | `vllm/v1/lwd_comm/data_comm/` | host-host UCX 传输 (UHC1): `data_plane_comm=host` 时承载边云数据帧; 公共设备装配在 `vllm/distributed/lwd/host/`，NPU 只保留后端注册与 HCCL 执行 |
+  | `vllm/v1/worker/lwd_edge/`、`vllm/model_executor/models/lwd/` | GPU/NPU 共用边侧 runner 与专用模型 builder；仅 embed + lm_head，无完整模型、零层占位、norm、hc_head 或 KV |
   | `vllm/v1/lwd_debug/` | 观测日志 |
   | `vllm/v1/core/sched/phase_scheduler.py` | prefill_only 对照实验臂, 非 LWD 部署使用 |
   | `tools/lwd_check_budget.py`, `log_analyze_tools/lwd_*` | kernel 预算检查 / 日志分析工具 |
