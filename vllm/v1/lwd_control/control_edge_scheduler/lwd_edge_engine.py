@@ -443,12 +443,8 @@ class LwdEdgeEngineCore(EngineCoreProc):
         是否有派发)。
 
         embed/unembed 均派发入队不收割,队首全局 FIFO 收割(序与
-        executor 排水序同构,不可交错);突发时一步连派至深度上限
-        喂饱 worker。派发序 embed 优先:196 并发下每云步都产 c2e,
-        若 unembed 先吃配额会把 embed 挤出本步(EMBED 被 decode 回程
-        挤住的饿死形态),TTFT 劣化——故 embed 先占位,unembed 用剩余
-        配额,代价是 decode token 交付最多延后 1-2 步(顶部全量收割
-        + c2e 队列背压兜底,不会饿死)。
+        executor 排水序同构,不可交错);EMBED 优先派发,有回包排队时
+        留一个名额给 UNEMBED。
 
         [Lwd][sched] 三类日志(饿死分析锚点):每批 harvest(含队列滞留
         wait)、每批 dispatch(含 ahead 队列构成/c2e 水位)、每步汇总。"""
@@ -503,7 +499,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
         d_emb = 0
         while (
             self._lwd_pending_refills
-            and len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
+            and self._lwd_can_dispatch_embed()
         ):
             refill_output = self._lwd_pending_refills.popleft()
             future = self.model_executor.execute_model(
@@ -514,8 +510,7 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
             prefill_work = True
             d_emb += 1
-        while (len(self._lwd_batch_queue) < LWD_EDGE_BATCH_QUEUE_DEPTH
-               and self.scheduler.has_requests()):
+        while self._lwd_can_dispatch_embed() and self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
             if not scheduler_output.num_scheduled_tokens:
                 break
@@ -544,6 +539,14 @@ class LwdEdgeEngineCore(EngineCoreProc):
             )
             return {0: step_outputs}, prefill_work
         return None, prefill_work
+
+    def _lwd_can_dispatch_embed(self) -> bool:
+        remaining = LWD_EDGE_BATCH_QUEUE_DEPTH - len(self._lwd_batch_queue)
+        # Recheck before taking the last slot: DOWN can arrive while an earlier
+        # EMBED is being dispatched. Refills share the same dispatch limit.
+        return remaining > 1 or (
+            remaining == 1 and self.lwd_c2e_meta_queue.empty()
+        )
 
     def _lwd_queue_mix(self) -> tuple[int, int]:
         """批队列构成 (embed数, unembed数):dispatch 日志的 ahead_unemb
