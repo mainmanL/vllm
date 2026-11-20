@@ -84,6 +84,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_comm.data_comm import sock as _sock
 from vllm.v1.lwd_comm.data_comm.ucx_link import (
     _UcxLink,
@@ -223,6 +224,11 @@ _HS_SESSION = int.from_bytes(os.urandom(8), "little")
 
 _UCX_ENV_LOGGED = False
 _DEFAULT_HS_TIMEOUT_S = 5.0
+
+# IO-thread state snapshot cadence, and how long a pre-posted receive may
+# dangle before it is reported as stuck (frames normally arrive in ms).
+_STATE_SNAPSHOT_S = 10.0
+_EXPECTS_STUCK_S = 5.0
 
 
 def _log_ucx_env_once() -> None:
@@ -1262,31 +1268,53 @@ class LwdUcxChannel:
                     "[ucx-chan] %s progress error (continuing): %r", self._name, exc
                 )
             now = time.monotonic()
-            if now - last_log >= 10.0:
-                if self._expects and self._expects_t0 and now - self._expects_t0 > 5.0:
-                    # pre-posts dangling >5s: the frame never came (the peer never sent
-                    # it, or the wire dropped it) or consumption stalled -- frames
-                    # normally arrive in milliseconds, so a persistent gap is odd
-                    logger.error(
-                        "[ucx-chan] %s recv expects stuck %.1fs: tags=%d "
-                        "min_tag=%d early=%d",
-                        self._name,
-                        now - self._expects_t0,
-                        len(self._expects),
-                        min(self._expects),
-                        self._early_count,
-                    )
-                logger.warning(
-                    "[ucx-chan][stall] %s sends=%d expects=%d(tags=%d) "
-                    "early=%d broken=%s",
-                    self._name,
-                    len(self._send_reqs),
-                    sum(len(q) for q in self._expects.values()),
-                    len(self._expects),
-                    self._early_count,
-                    self._broken,
-                )
+            if now - last_log >= _STATE_SNAPSHOT_S:
                 last_log = now
+                self._log_state(now)
+
+    def _log_state(self, now: float) -> None:
+        """Report the pending work of this channel, but only when it has any.
+
+        Runs on the IO thread, once per snapshot tick of the IO loop. An
+        all-idle channel reports nothing: zero sends, zero expects and an
+        empty early store say no more than "no traffic", and logging that per
+        channel every tick floods the log of an idle deployment. A dangling
+        pre-post is a real fault, so it keeps the vllm error log and replaces
+        the snapshot for that tick.
+        """
+        if (
+            self._expects
+            and self._expects_t0
+            and now - self._expects_t0 > _EXPECTS_STUCK_S
+        ):
+            # pre-posts dangling >5s: the frame never came (the peer never sent
+            # it, or the wire dropped it) or consumption stalled -- frames
+            # normally arrive in milliseconds, so a persistent gap is odd
+            logger.error(
+                "[ucx-chan] %s recv expects stuck %.1fs: tags=%d min_tag=%d early=%d",
+                self._name,
+                now - self._expects_t0,
+                len(self._expects),
+                min(self._expects),
+                self._early_count,
+            )
+            return
+        if not (self._send_reqs or self._expects or self._early_count or self._broken):
+            return
+        lwd_logger.info(
+            "[ucx-chan][stall] %s sends=%d expects=%d(tags=%d) "
+            "early=%d broken=%s op=%s",
+            self._name,
+            len(self._send_reqs),
+            sum(len(q) for q in self._expects.values()),
+            len(self._expects),
+            self._early_count,
+            self._broken,
+            # both directions of one connection share the channel name
+            # (cli:host:port / srv:port), so the snapshot has to say which
+            # direction it describes
+            "send" if self._pool_staging else "recv",
+        )
 
     def _progress_link(self) -> None:
         if self._link is None or not self._ready.is_set():

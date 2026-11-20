@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.core.kv_cache_manager import KVCacheManager
     from vllm.v1.core.kv_cache_utils import KVCacheBlock
-    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
     from vllm.v1.lwd_control.lwd_comm.lwd_prefix import (
         LwdPrefixManifest,
         LwdProbeResult,
@@ -189,6 +189,57 @@ class LwdPrefixCacheState(NamedTuple):
     reservations: LwdPrefixReservations | None = None
 
 
+def _lwd_check_cacheable_specs(
+    kv_cache_config: KVCacheConfig,
+) -> list[KVCacheSpec]:
+    """Return the layer specs LWD serves prefix hits from.
+
+    Groups that opt out of prefix caching are left out: the coordinator keeps
+    them out of hit lookup, so their spec type cannot affect a hit and must
+    not gate the layout. DeepSeek V4.1 ships such a group (the compressor
+    ring), as does GLM-5.3-Flash (the kpool tail).
+
+    Raises:
+        ValueError: No prefix-cacheable group remains, or one of them has a
+            spec type LWD cannot serve hits from.
+    """
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        MambaSpec,
+        SlidingWindowSpec,
+        iter_layer_specs,
+    )
+
+    specs = [
+        spec
+        for group in kv_cache_config.kv_cache_groups
+        if group.kv_cache_spec.prefix_cacheable
+        for spec in iter_layer_specs(group.kv_cache_spec)
+    ]
+    if not specs:
+        raise ValueError(
+            "LWD prefix caching requires at least one prefix-cacheable KV "
+            "cache group on cloud"
+        )
+    unsupported = sorted(
+        {
+            type(spec).__name__
+            for spec in specs
+            if not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec, MambaSpec))
+            or (
+                isinstance(spec, MambaSpec)
+                and spec.mamba_cache_mode not in ("align", "all")
+            )
+        }
+    )
+    if unsupported:
+        raise ValueError(
+            "LWD prefix caching supports Full Attention/MLA, sliding-window "
+            f"and Mamba align/all groups only; got {unsupported}"
+        )
+    return specs
+
+
 def init_lwd_prefix_cache(
     vllm_config: VllmConfig,
     kv_cache_config: KVCacheConfig,
@@ -196,14 +247,29 @@ def init_lwd_prefix_cache(
     *,
     use_eagle: bool = False,
 ) -> LwdPrefixCacheState:
-    """Validate the cloud KV layout and create its reservation table."""
+    """Validate the cloud KV layout and create its reservation table.
+
+    Only prefix-cacheable groups are validated: groups that opt out (the
+    DeepSeek V4.1 compressor ring, the GLM-5.3-Flash kpool tail) are excluded
+    from hit lookup by the coordinator, so their spec type cannot affect a hit.
+
+    Args:
+        vllm_config: Engine configuration carrying the cache and parallel
+            settings.
+        kv_cache_config: Resolved KV cache groups of this cloud instance.
+        manager: KV cache manager that owns the reservation table.
+        use_eagle: Whether EAGLE/MTP drafting is enabled.
+
+    Returns:
+        The prefix cache state, disabled when prefix caching is off.
+
+    Raises:
+        ValueError: Prefix caching is requested but the cloud runs without it,
+            PCP is enabled, no prefix-cacheable group remains, or one of those
+            groups has an unsupported spec type.
+    """
     from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
-    from vllm.v1.kv_cache_interface import (
-        FullAttentionSpec,
-        MambaSpec,
-        SlidingWindowSpec,
-        UniformTypeKVCacheSpecs,
-    )
+    from vllm.v1.kv_cache_interface import MambaSpec
 
     enabled = bool(vllm_config.cache_config.enable_prefix_caching)
     hash_block_size = resolve_kv_cache_block_sizes(kv_cache_config, vllm_config)[1]
@@ -217,26 +283,7 @@ def init_lwd_prefix_cache(
             "(prefill_context_parallel_size > 1)"
         )
 
-    specs = []
-    for group in kv_cache_config.kv_cache_groups:
-        spec = group.kv_cache_spec
-        specs.extend(
-            spec.kv_cache_specs.values()
-            if isinstance(spec, UniformTypeKVCacheSpecs)
-            else [spec]
-        )
-    if not specs or any(
-        not isinstance(spec, (FullAttentionSpec, SlidingWindowSpec, MambaSpec))
-        or (
-            isinstance(spec, MambaSpec)
-            and spec.mamba_cache_mode not in ("align", "all")
-        )
-        for spec in specs
-    ):
-        raise ValueError(
-            "LWD prefix caching currently supports Full Attention/MLA, "
-            "sliding-window and Mamba align/all groups only"
-        )
+    specs = _lwd_check_cacheable_specs(kv_cache_config)
 
     coordinator = manager.coordinator
     # The coordinator's hit alignment is authoritative: fine-grained partial
