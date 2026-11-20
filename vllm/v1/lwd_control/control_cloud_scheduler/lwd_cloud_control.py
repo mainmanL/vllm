@@ -106,13 +106,21 @@ class LwdCloudControlBridge:
     """
 
     def __init__(self, command_queue: Any, event_queue: Any) -> None:
-        # Cloud-local DP per-engine command queues: accept one queue (dp=1,
-        # preserving legacy behavior) or a queue list (dp>1, addressed fanout).
-        # The event queue remains shared.
-        if isinstance(command_queue, (list, tuple)):
+        # A mapping preserves global ranks for services managing a subset of
+        # DPs. Lists/single queues retain the ordinary probe API compatibility.
+        if isinstance(command_queue, dict):
+            self._command_queue_map = dict(command_queue)
+            self._command_queues = list(command_queue.values())
+        elif isinstance(command_queue, (list, tuple)):
             self._command_queues: list[Any] = list(command_queue)
+            self._command_queue_map = dict(enumerate(self._command_queues))
         else:
             self._command_queues = [command_queue]
+            self._command_queue_map = {0: command_queue}
+        self._engine_ranks = list(self._command_queue_map)
+        from vllm.v1.lwd_control.pd.cloud_http import LwdPdCloudHttpBridge
+
+        self.pd = LwdPdCloudHttpBridge(self._command_queue_map)
         self._command_queue = self._command_queues[0]
         self._event_queue = event_queue
         self._probe_futures: dict[str, asyncio.Future] = {}
@@ -141,6 +149,7 @@ class LwdCloudControlBridge:
         daemon thread without a shutdown channel; without the hook, process
         exit could only hard-kill the daemon dispatch thread."""
         self._closed = True
+        self.pd.close()
         with self._lock:
             pending = [*self._probe_futures.values(), *self._usage_futures.values()]
             self._probe_futures.clear()
@@ -320,7 +329,7 @@ class LwdCloudControlBridge:
                     stale_waiter.put_nowait((False, -1, "superseded"))
         results: dict[int, LwdProbeResult] = {}
         try:
-            for idx, cmd_queue in enumerate(self._command_queues):
+            for idx, cmd_queue in self._command_queue_map.items():
                 cmd_queue.put(
                     {
                         "type": "probe",
@@ -363,7 +372,7 @@ class LwdCloudControlBridge:
                 # in waiter.get. Poison it so every attempt releases its thread.
                 with contextlib.suppress(Exception):
                     waiter.put_nowait((False, -1, "poison"))
-            missing = [i for i in range(n) if i not in results]
+            missing = [i for i in self._engine_ranks if i not in results]
             if missing:
                 # Slow or failed engines count as zero-hit for observability but
                 # are never placement candidates. Fail only if none answered.
@@ -378,7 +387,10 @@ class LwdCloudControlBridge:
                         f"prefix probe fanout timed out after {timeout}s"
                     )
             # Select argmax(hit_tokens), rotating among tied live engines.
-            hits = [results[i].hit_tokens if i in results else 0 for i in range(n)]
+            hits = {
+                i: results[i].hit_tokens if i in results else 0
+                for i in self._engine_ranks
+            }
             top = max(hits[i] for i in results) if results else 0
             candidates = [i for i in results if hits[i] == top]
             if len(candidates) > 1:
@@ -445,6 +457,9 @@ class LwdCloudControlBridge:
             except queue.Empty:
                 continue
             kind = event.get("type")
+            if kind in ("pd_register", "pd_export", "pd_result"):
+                self.pd.dispatch(event)
+                continue
             request_id = event.get("request_id")
             with self._lock:
                 table = self._probe_futures if kind == "probe" else self._usage_futures
@@ -512,7 +527,12 @@ class LwdCloudControlBridge:
             if future is None or future.done():
                 return  # Timed out/cancelled; the edge already failed open.
             if event.get("ok"):
-                future.set_result(event.get("result"))
+                result = event.get("result")
+                if len(self._engine_ranks) == 1:
+                    result = dataclass_replace(
+                        result, engine_index=self._engine_ranks[0]
+                    )
+                future.set_result(result)
             else:
                 future.set_exception(RuntimeError(event.get("error") or "probe failed"))
             return
@@ -550,7 +570,7 @@ class LwdCloudControlProcessor:
         self._pending_queue = pending_queue
         self._event_queue = event_queue
 
-    def poll(self, coordinator: Any) -> int:
+    def poll(self, coordinator: Any, *, pd_handler: Any = None) -> int:
         """Consume pending commands and return the count ([LWD][perf] I4).
 
         A count above one directly shows probes waiting for the cloud engine
@@ -567,6 +587,23 @@ class LwdCloudControlProcessor:
             logger.debug(
                 "[LWD][ctrl] poll consumed command type=%s", command.get("type")
             )
+            if command.get("type") == "pd_register":
+                if pd_handler is None:
+                    self._event_queue.put(
+                        {
+                            "type": "pd_register",
+                            "request_id": wrap_req_id(
+                                command["envelope"]["edge_id"],
+                                command["envelope"]["rid"],
+                            ),
+                            "attempt_id": command["envelope"]["attempt_id"],
+                            "ok": False,
+                            "error": "PD is not enabled on this engine",
+                        }
+                    )
+                else:
+                    pd_handler(command)
+                continue
             if command.get("type") == "probe":
                 manifest: LwdPrefixManifest = command["manifest"]
                 # Cloud-local DP protocol fields (defaults preserve legacy
@@ -675,6 +712,9 @@ def create_lwd_cloud_control_app(
     *,
     enforce_mm_abi_match: bool = True,
     probe_timeout: float = 25.0,
+    pd_config: Any = None,
+    stage_role: str = "",
+    pd_model_names: tuple[str, ...] = (),
 ) -> Any:
     """FastAPI control-plane app; successful responses use OpenAI SSE.
 
@@ -703,6 +743,31 @@ def create_lwd_cloud_control_app(
             body = await request.json()
         except Exception as exc:  # noqa: BLE001
             return JSONResponse({"error": f"bad request: {exc}"}, status_code=400)
+        from vllm.v1.lwd_control.pd.cloud_http import (
+            lwd_pd_envelope_from_body,
+            lwd_pd_http_response,
+            lwd_validate_pd_model_identity,
+        )
+
+        try:
+            envelope = lwd_pd_envelope_from_body(body)
+        except (ValueError, KeyError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if envelope is not None:
+            if pd_config is None:
+                return JSONResponse({"error": "PD is not configured"}, status_code=400)
+            try:
+                lwd_validate_pd_model_identity(
+                    envelope,
+                    processor_fingerprint,
+                    pd_model_names,
+                    enforce_mm_abi_match=enforce_mm_abi_match,
+                )
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
+            return await lwd_pd_http_response(
+                bridge.pd, body, envelope, stage_role, pd_config
+            )
         try:
             mm_abi_header = _negotiate_lwd_protocol_headers(
                 headers,
@@ -893,15 +958,17 @@ def create_lwd_cloud_control_app(
 
 def start_lwd_cloud_control_server(
     vllm_config: Any,
-) -> tuple[list[Any] | None, Any | None]:
+    *,
+    managed_dp_ranks: tuple[int, ...] | None = None,
+) -> tuple[dict[int, Any] | None, Any | None]:
     """Start the parent HTTP control service and queue bridge when enabled.
 
     Return ``(command_queues, event_queue)`` for child EngineCore processes via
     ``CoreEngineProcManager``; return ``(None, None)`` when coordination is
-    disabled or the role is not cloud. command_queues is per-engine: its length
-    is dp_size for cloud-local dp>1, indexed by global dp_rank for addressed
-    probe fanout. For dp=1 it has one element, preserving legacy semantics.
-    event_queue remains shared by all engines (events carry engine_index).
+    disabled or the role is not cloud. command_queues maps the actual locally
+    managed global DP ranks to queues. External-LB services do not create or
+    wait for queues belonging to engines in another process. event_queue is
+    shared by the managed engines (events carry their global engine_index).
 
     Uvicorn and the bridge run on background threads; call this before spawning
     EngineCoreProc.
@@ -921,7 +988,12 @@ def start_lwd_cloud_control_server(
     # Each cloud-local DP engine has an independent KV pool/prefix cache, so
     # probes must fan out to every engine.
     dp_size = max(int(vllm_config.parallel_config.data_parallel_size), 1)
-    command_queues = [mp_ctx.Queue() for _ in range(dp_size)]
+    if managed_dp_ranks is None:
+        parallel = vllm_config.parallel_config
+        count = int(getattr(parallel, "data_parallel_size_local", None) or dp_size)
+        first = int(parallel.data_parallel_rank)
+        managed_dp_ranks = tuple(range(first, first + count))
+    command_queues = {rank: mp_ctx.Queue() for rank in managed_dp_ranks}
     event_queue = mp_ctx.Queue()
     bridge = LwdCloudControlBridge(command_queues, event_queue)
     bridge.start()
@@ -934,18 +1006,29 @@ def start_lwd_cloud_control_server(
     # is enabled. Derive the probe limit from the edge timeout minus headroom so
     # the cloud answers first (200/503).
     cloud_probe_timeout = max(coord_cfg.probe_timeout - _CLOUD_PROBE_HEADROOM_S, 1.0)
+    model_names = vllm_config.model_config.served_model_name
+    if isinstance(model_names, str):
+        model_names = (model_names,)
     app = create_lwd_cloud_control_app(
         bridge,
         compute_processor_fingerprint(vllm_config.model_config),
         enforce_mm_abi_match=coord_cfg.enforce_mm_abi_match,
         probe_timeout=cloud_probe_timeout,
+        pd_config=lwd_config.pd,
+        stage_role=lwd_config.stage_role,
+        pd_model_names=tuple(model_names or (vllm_config.model_config.model,)),
     )
+    listen_port = coord_cfg.listen_port
+    if lwd_config.pd.enabled and vllm_config.parallel_config.data_parallel_external_lb:
+        listen_port += int(vllm_config.parallel_config.data_parallel_rank)
+    if listen_port > 65535:
+        raise ValueError("[LWD] per-DP control port exceeds 65535")
     threading.Thread(
         target=uvicorn.run,
         args=(app,),
         kwargs={
             "host": coord_cfg.listen_host,
-            "port": coord_cfg.listen_port,
+            "port": listen_port,
             "log_level": "warning",
         },
         name="lwd-cloud-ctrl",
@@ -956,7 +1039,7 @@ def start_lwd_cloud_control_server(
         "(cloud dp_size=%d, %d engine command queue(s), "
         "probe_timeout=%.1fs enforce_mm_abi_match=%s)",
         coord_cfg.listen_host,
-        coord_cfg.listen_port,
+        listen_port,
         dp_size,
         len(command_queues),
         cloud_probe_timeout,

@@ -1,0 +1,7 @@
+{
+  "lwd_config": {
+    "path": "/etc/lwd/pd_host_2p4d.yaml",
+    "role": "edge",
+    "instance_id": 0
+  }
+}

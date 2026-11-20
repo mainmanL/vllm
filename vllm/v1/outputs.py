@@ -375,6 +375,10 @@ class ModelRunnerOutput:
 
     # Per-connection contiguous UP send-completion watermarks.
     lwd_up_send_watermarks: dict[object, int] = field(default_factory=dict)
+    # Actual D tail forwards completed in this output generation.
+    lwd_pd_tail_consumed: set[str] = field(default_factory=set)
+    lwd_pd_tail_identities: dict[str, tuple[str, str]] = field(default_factory=dict)
+    lwd_pd_down_metadata: dict[object, dict[str, object]] = field(default_factory=dict)
 
     @staticmethod
     def with_kv_conn_output_only(

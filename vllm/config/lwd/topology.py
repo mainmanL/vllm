@@ -92,6 +92,27 @@ class LwdHostDataPlane:
     of a link must match."""
 
 
+LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
+
+
+@dataclass(frozen=True, config=ConfigDict(extra="forbid"))
+class LwdPdConfig:
+    """Shared PD limits; model and scheduler settings stay instance-local."""
+
+    enabled: StrictBool = False
+    max_window_tokens: Annotated[int, Field(strict=True, ge=0)] = 0
+    max_inflight_windows: Annotated[int, Field(strict=True, ge=1)] = 4
+    d_output_quota_rows: Annotated[int, Field(strict=True, ge=0)] = 0
+    p_bind_timeout_s: LwdPositiveSeconds = 30.0
+    d_bind_timeout_s: LwdPositiveSeconds = 30.0
+    usage_wait_timeout_s: LwdPositiveSeconds = 600.0
+    request_ttl_s: LwdPositiveSeconds = 1800.0
+    tenant_id: str = ""
+    notify_claim_timeout_s: LwdPositiveSeconds = 60.0
+    export_hold_timeout_s: LwdPositiveSeconds = 600.0
+    result_hold_timeout_s: LwdPositiveSeconds = 600.0
+
+
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdDeployment:
     mode: Annotated[int, Field(strict=True, ge=0, le=0)]
@@ -104,6 +125,7 @@ class LwdDeployment:
     """Host-comm settings block, required when ``data_plane_comm: host``
     and omitted otherwise — the extension point for future host-plane
     properties."""
+    pd: LwdPdConfig = Field(default_factory=LwdPdConfig)
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -149,9 +171,6 @@ class LwdScramble:
 class LwdFeatures:
     enable_early_recv: StrictBool = False
     scramble: LwdScramble = Field(default_factory=LwdScramble)
-
-
-LwdPositiveSeconds = Annotated[float, Field(strict=True, gt=0, allow_inf_nan=False)]
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -230,6 +249,7 @@ class LwdInstance:
     id: LwdId
     dp: Annotated[tuple[LwdDP, ...], Field(min_length=1)]
     coordination: LwdCoordination | None = None
+    stage_role: Literal["", "prefill", "decode"] = ""
 
     @field_validator("dp")
     @classmethod
@@ -248,7 +268,7 @@ class LwdLink:
 
 @dataclass(frozen=True, order=True)
 class LwdConnectionId:
-    """Stable identity of one edge -> cloud DP/engine connection."""
+    """Stable edge -> cloud engine identity; dp_idx always names the cloud DP."""
 
     edge_id: int
     cloud_id: int
@@ -355,19 +375,54 @@ class LwdTopology:
                 raise ValueError(
                     "[LWD] ctrl_port is required on clouds and omitted on edges"
                 )
+        self._validate_pd()
         self._validate_scene()
         self._validate_coordination()
-        if len({len(instance.dp) for instance in (*self.edges, *self.clouds)}) != 1:
-            raise ValueError(
-                "[LWD] Instances must have matching DP indices and the same DP count"
-            )
         if self.is_host_comm:
             # No shared HCCL world: the host-specific layout rules apply
             # instead of the rank-allocation ones.
             self._validate_host_layout()
         else:
+            if len({len(i.dp) for i in (*self.edges, *self.clouds)}) != 1:
+                raise ValueError(
+                    "[LWD] Instances must have matching DP indices "
+                    "and the same DP count"
+                )
             self._validate_ranks()
         self._validate_control_ports()
+
+    def _validate_pd(self) -> None:
+        if any(edge.stage_role for edge in self.edges):
+            raise ValueError("[LWD] stage_role belongs to cloud instances only")
+        if not self.deployment.pd.enabled:
+            if any(cloud.stage_role for cloud in self.clouds):
+                raise ValueError("[LWD] stage_role requires deployment.pd.enabled")
+            return
+        if not self.is_host_comm:
+            raise ValueError("[LWD] PD separation requires data_plane_comm=host")
+        host_plane = self.deployment.data_plane_host
+        if host_plane is None or host_plane.up_buffer_size is None:
+            raise ValueError(
+                "[LWD] PD requires an explicit "
+                "deployment.data_plane_host.up_buffer_size: independent edge/P/D "
+                "token budgets cannot infer a shared maximum frame capacity"
+            )
+        if self.deployment.scene == "edge_share":
+            raise ValueError("[LWD] PD requires independent edge instances")
+        if {cloud.stage_role for cloud in self.clouds} != {"prefill", "decode"}:
+            raise ValueError("[LWD] PD requires separate prefill and decode clouds")
+        for instance in (*self.edges, *self.clouds):
+            if instance.coordination is None or not instance.coordination.enabled:
+                raise ValueError("[LWD] PD requires coordination on every instance")
+        for edge in self.edges:
+            coordination = edge.coordination
+            assert coordination is not None
+            if coordination.placement_only or not coordination.tenant_key_file:
+                raise ValueError("[LWD] PD requires authenticated edge coordination")
+            if not coordination.control_url:
+                raise ValueError("[LWD] PD edge requires a single Proxy control_url")
+            if not (self.deployment.pd.tenant_id or coordination.consumer_id):
+                raise ValueError("[LWD] PD requires tenant_id or edge consumer_id")
 
     def _validate_host_layout(self) -> None:
         """Layout rules of data_plane_comm=host (no global comm domain).
@@ -539,12 +594,17 @@ class LwdTopology:
             local_id = link.edge if role == "edge" else link.cloud
             if local_id != instance_id:
                 continue
-            for edge_dp, cloud_dp in zip(
-                self.edges[link.edge].dp, self.clouds[link.cloud].dp
-            ):
+            edge_dps = self.edges[link.edge].dp
+            cloud_dps = self.clouds[link.cloud].dp
+            pairs = (
+                ((edge_dps[0], cloud_dp) for cloud_dp in cloud_dps)
+                if self.is_host_comm
+                else zip(edge_dps, cloud_dps)
+            )
+            for edge_dp, cloud_dp in pairs:
                 result.append(
                     LwdDPConnection(
-                        LwdConnectionId(link.edge, link.cloud, edge_dp.dp_idx),
+                        LwdConnectionId(link.edge, link.cloud, cloud_dp.dp_idx),
                         edge_dp,
                         cloud_dp,
                     )

@@ -198,12 +198,13 @@ def lwd_check_parallel_config(vllm_config: VllmConfig) -> None:
         # rank-allocation checks below are device-only. Each DP is an
         # independent engine launch, so the parallel sizes must match the
         # local instance's DP count instead.
-        if parallel_config.data_parallel_size != len(lwd_config.instance.dp):
+        expected_dp = 1 if lwd_config.role == "edge" else len(lwd_config.instance.dp)
+        if parallel_config.data_parallel_size != expected_dp:
             raise ValueError(
                 f"[LWD] data parallel size {parallel_config.data_parallel_size} "
-                f"!= {len(lwd_config.instance.dp)} DPs of {lwd_config.role} "
-                f"instance {lwd_config.instance_id} (host comm: one engine "
-                "launch per DP)"
+                f"!= {expected_dp} DPs of {lwd_config.role} "
+                f"instance {lwd_config.instance_id} (host comm: one edge engine "
+                "serves every cloud DP)"
             )
         return
     # Raises for topologies the shared HCCL world cannot host.

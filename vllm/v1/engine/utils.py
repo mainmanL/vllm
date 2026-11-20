@@ -179,14 +179,21 @@ class CoreEngineProcManager:
             )
 
             cloud_control_command_queue, cloud_control_event_queue = (
-                start_lwd_cloud_control_server(vllm_config)
+                start_lwd_cloud_control_server(
+                    vllm_config,
+                    managed_dp_ranks=tuple(
+                        range(start_index, start_index + local_engine_count)
+                    ),
+                )
             )
         if cloud_control_command_queue is None:
             command_queues = None
+        elif isinstance(cloud_control_command_queue, dict):
+            command_queues = cloud_control_command_queue
         elif isinstance(cloud_control_command_queue, (list, tuple)):
-            command_queues = list(cloud_control_command_queue)
+            command_queues = dict(enumerate(cloud_control_command_queue))
         else:
-            command_queues = [cloud_control_command_queue]
+            command_queues = {start_index: cloud_control_command_queue}
         common_kwargs = {
             "vllm_config": vllm_config,
             "local_client": local_client,
@@ -195,7 +202,7 @@ class CoreEngineProcManager:
             "log_stats": log_stats,
             "tensor_queue": tensor_queue,
             "cloud_control_command_queue": (
-                command_queues[0] if command_queues else None
+                next(iter(command_queues.values())) if command_queues else None
             ),
             "cloud_control_event_queue": cloud_control_event_queue,
         }
@@ -219,8 +226,8 @@ class CoreEngineProcManager:
                 "dp_rank": global_index,
                 "local_dp_rank": local_index,
             }
-            if command_queues is not None and len(command_queues) > 1:
-                if global_index >= len(command_queues):
+            if command_queues is not None:
+                if global_index not in command_queues:
                     raise RuntimeError(
                         f"[LWD] cloud control queues ({len(command_queues)}) "
                         f"do not cover global dp_rank {global_index}"

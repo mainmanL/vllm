@@ -10,7 +10,14 @@ from typing_extensions import TypedDict
 
 from .api import LwdAPIConfig
 from .coordination import LwdCoordinationConfig
-from .topology import LwdDPConnection, LwdId, LwdInstance, LwdString, LwdTopology
+from .topology import (
+    LwdDPConnection,
+    LwdId,
+    LwdInstance,
+    LwdPdConfig,
+    LwdString,
+    LwdTopology,
+)
 
 
 @with_config(ConfigDict(extra="forbid"))
@@ -80,6 +87,14 @@ class LwdConfig:
     @property
     def instance(self) -> LwdInstance:
         return self.topology.instance(self.role, self.instance_id)
+
+    @property
+    def pd(self) -> LwdPdConfig:
+        return self.topology.deployment.pd
+
+    @property
+    def stage_role(self) -> str:
+        return self.instance.stage_role
 
     @property
     def connections(self) -> tuple[LwdDPConnection, ...]:

@@ -37,7 +37,7 @@ class LwdPrefixReservations:
         manager.lwd_prefix_reservations = self
         manager.lwd_prefix_caching = True
 
-    def reserve(self, request: Request) -> int:
+    def reserve(self, request: Request, *, max_hit_tokens: int | None = None) -> int:
         """Reserve the negotiated hit and freeze its snapshot."""
         if request.request_id in self._reservations:
             raise ValueError(f"duplicate LWD prefix reservation: {request.request_id}")
@@ -45,9 +45,12 @@ class LwdPrefixReservations:
             groups: tuple[Sequence[KVCacheBlock], ...] = ()
             hit = 0
         else:
+            maximum = max(0, request.num_prompt_tokens - 1)
+            if max_hit_tokens is not None:
+                maximum = min(maximum, max(0, max_hit_tokens))
             groups, hit, _ = self.manager.coordinator.find_longest_cache_hit(
                 request.block_hashes,
-                max_cache_hit_length=max(0, request.num_prompt_tokens - 1),
+                max_cache_hit_length=maximum,
             )
         return self._touch_and_snapshot(request, groups, hit, set_floor=True)
 

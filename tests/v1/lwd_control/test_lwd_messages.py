@@ -88,7 +88,7 @@ def _real_fields_from_source() -> dict[str, bool]:
 
 
 def test_request_notify_round_trips_full_prompt_mrope_positions() -> None:
-    assert LWD_MESSAGE_VERSION == 4
+    assert LWD_MESSAGE_VERSION == 6
     payload = bytes(range(24))
     decoded = lwd_decode_edge_to_cloud(
         lwd_encode_message(

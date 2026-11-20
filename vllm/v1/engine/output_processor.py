@@ -32,6 +32,11 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.lwd_control.pd.lwd_frontend_result import (
+    LwdFrontendReason,
+    LwdFrontendResult,
+    LwdFrontendResultInbox,
+)
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -155,8 +160,10 @@ class RequestState:
         n: int | None = None,
         temperature: float | None = None,
         stream_input: bool = False,
+        lwd_pd_attempt_id: str | None = None,
     ):
         self.request_id = request_id
+        self.lwd_pd_attempt_id = lwd_pd_attempt_id
         self.external_req_id = external_req_id
         self.parent_req = parent_req
         self.request_index = request_index
@@ -281,6 +288,11 @@ class RequestState:
             log_stats=log_stats,
             stream_interval=stream_interval,
             stream_input=request.resumable,
+            lwd_pd_attempt_id=(
+                (request.sampling_params.extra_args or {}).get("lwd_pd_attempt_id")
+                if request.sampling_params is not None
+                else None
+            ),
         )
 
     def make_request_output(
@@ -459,6 +471,7 @@ class OutputProcessor:
         stream_interval: int = 1,
         tracing_enabled: bool = False,
         admission_stats: "SharedAdmissionStats | None" = None,
+        lwd_pd_results: LwdFrontendResultInbox | None = None,
     ):
         self.log_stats = log_stats
         self.tokenizer = tokenizer
@@ -469,6 +482,31 @@ class OutputProcessor:
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled = tracing_enabled
         self.admission_stats = admission_stats
+        self.lwd_pd_results = lwd_pd_results
+
+    def _freeze_pd_result(
+        self,
+        state: RequestState,
+        reason: LwdFrontendReason,
+        cancel_execution: bool,
+    ) -> None:
+        inbox = getattr(self, "lwd_pd_results", None)
+        if inbox is None:
+            return
+        attempt = state.lwd_pd_attempt_id
+        if attempt is None:
+            return
+        if state.detokenizer is None:
+            raise RuntimeError("PD frontend result has no authoritative token count")
+        inbox.freeze(
+            LwdFrontendResult(
+                state.request_id,
+                attempt,
+                state.detokenizer.num_output_tokens(),
+                reason,
+                cancel_execution,
+            )
+        )
 
     def get_num_unfinished_requests(self):
         return len(self.request_states)
@@ -494,10 +532,16 @@ class OutputProcessor:
         """Propagate error to all generate() tasks."""
 
         for _, state in self.request_states.items():
+            self._freeze_pd_result(state, "error", True)
             assert state.queue is not None
             state.queue.put(e)
 
-    def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
+    def abort_requests(
+        self,
+        request_ids: Iterable[str],
+        internal: bool,
+        frontend_reason: LwdFrontendReason = "cancelled",
+    ) -> list[str]:
         """Abort a list of requests.
 
         The request_ids may be either external request IDs (those passed to
@@ -512,6 +556,17 @@ class OutputProcessor:
         a parent request, in which case the associated child requests are aborted
         also.
         """
+        request_ids = tuple(request_ids)
+        if self.lwd_pd_results is not None:
+            for request_id in request_ids:
+                candidates = (
+                    (request_id,)
+                    if internal
+                    else tuple(self.external_req_ids.get(request_id, ()))
+                )
+                for candidate in candidates:
+                    if state := self.request_states.get(candidate):
+                        self._freeze_pd_result(state, frontend_reason, True)
         internal_req_ids = []
         for request_id in request_ids:
             if internal:
@@ -531,8 +586,10 @@ class OutputProcessor:
 
         request_ids_to_abort = []
         for request_id in internal_req_ids:
-            req_state = self.request_states.pop(request_id, None)
+            req_state = self.request_states.get(request_id)
             if req_state is not None:
+                self._freeze_pd_result(req_state, frontend_reason, True)
+                self.request_states.pop(request_id)
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
@@ -555,7 +612,9 @@ class OutputProcessor:
                 # Abort children prior to removing the parent.
                 if parent.child_requests:
                     child_reqs = list(parent.child_requests)
-                    child_reqs = self.abort_requests(child_reqs, internal=True)
+                    child_reqs = self.abort_requests(
+                        child_reqs, internal=True, frontend_reason=frontend_reason
+                    )
                     request_ids_to_abort.extend(child_reqs)
                 self.parent_requests.pop(request_id, None)
         self._update_admission_stats()
@@ -601,6 +660,7 @@ class OutputProcessor:
             # Final request - just mark completion, don't add its dummy tokens.
             if req_state.input_chunk_queue is None:
                 # Engine already finished - emit final output and clean up.
+                self._freeze_pd_result(req_state, "complete", False)
                 self._finish_request(req_state)
                 if req_state.queue is not None:
                     # Emit a final output with finished=True
@@ -663,6 +723,13 @@ class OutputProcessor:
                 # Ignore output for already-aborted request.
                 continue
 
+            if self.lwd_pd_results is not None and req_state.lwd_pd_attempt_id:
+                output_attempt = engine_core_output.lwd_pd_attempt_id
+                if not output_attempt:
+                    raise RuntimeError("PD output is missing its request attempt")
+                if output_attempt != req_state.lwd_pd_attempt_id:
+                    continue
+
             # 1) Compute stats for this iteration.
             self._update_stats_from_output(
                 req_state, engine_core_output, engine_core_timestamp, iteration_stats
@@ -672,6 +739,7 @@ class OutputProcessor:
             pooling_output = engine_core_output.pooling_output
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
+            frontend_stop = False
             kv_transfer_params = engine_core_output.kv_transfer_params
             ec_transfer_params = engine_core_output.ec_transfer_params
             if engine_core_output.routed_experts is not None:
@@ -704,6 +772,7 @@ class OutputProcessor:
                     new_token_ids, finish_reason == FinishReason.STOP
                 )
                 if stop_string:
+                    frontend_stop = True
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
 
@@ -739,6 +808,21 @@ class OutputProcessor:
                     else:
                         req_state.input_chunk_queue = None
                 else:
+                    reason: LwdFrontendReason = (
+                        "stop_string"
+                        if frontend_stop
+                        else "cancelled"
+                        if finish_reason == FinishReason.ABORT
+                        else "error"
+                        if finish_reason
+                        in (FinishReason.ERROR, FinishReason.REPETITION)
+                        else "complete"
+                    )
+                    self._freeze_pd_result(
+                        req_state,
+                        reason,
+                        not engine_core_output.finished,
+                    )
                     self._finish_request(req_state)
                     if not engine_core_output.finished:
                         # If req not finished in EngineCore, but Detokenizer

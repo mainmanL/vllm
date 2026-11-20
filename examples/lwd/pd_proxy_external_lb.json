@@ -1,0 +1,12 @@
+{
+  "prefill": [
+    {"cloud_id": 0, "target_dp": 0, "url": "http://10.1.0.1:8100/v1/chat/completions"},
+    {"cloud_id": 0, "target_dp": 1, "url": "http://10.1.0.1:8101/v1/chat/completions"}
+  ],
+  "decode": [
+    {"cloud_id": 1, "target_dp": 0, "url": "http://10.1.0.2:8100/v1/chat/completions"},
+    {"cloud_id": 1, "target_dp": 1, "url": "http://10.1.0.2:8101/v1/chat/completions"},
+    {"cloud_id": 1, "target_dp": 2, "url": "http://10.1.0.2:8102/v1/chat/completions"},
+    {"cloud_id": 1, "target_dp": 3, "url": "http://10.1.0.2:8103/v1/chat/completions"}
+  ]
+}

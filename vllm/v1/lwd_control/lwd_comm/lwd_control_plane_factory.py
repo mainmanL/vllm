@@ -3,8 +3,8 @@
 """Build the control plane of one DP rank from `VllmConfig.lwd_config`.
 
 Every cloud DP rank binds its topology `ctrl_port` on all interfaces. One
-edge process serves every DP connection of its instance: the edge plane of
-DP rank i connects to the cloud DP rank of the same index.
+edge engine serves every reachable cloud DP connection of its instance.
+Connection dp_idx names the cloud DP; the edge engine's native DP rank is 0.
 """
 
 from vllm.config.lwd import LwdConfig
@@ -96,8 +96,8 @@ def _lwd_edge_spec(
 ) -> LwdEdgeControlPlaneSpec:
     """Endpoints of the cloud DP ranks this edge engine connects to.
 
-    One edge process serves every DP connection of its instance: link i
-    connects to the cloud DP rank of DP index i.
+    One edge process serves all reachable cloud DPs, including clouds with
+    different DP counts.
     """
     connections = sorted(lwd_config.connections, key=lambda c: c.connection_id)
     cloud_dp_sizes = {cloud.id: len(cloud.dp) for cloud in lwd_config.topology.clouds}

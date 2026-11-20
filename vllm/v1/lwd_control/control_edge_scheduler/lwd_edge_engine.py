@@ -12,6 +12,9 @@ normally completed batch returning None becomes a placeholder).
 Startup blocks until every cloud DP rank accepted the handshake and sent its
 scheduling limits, within one handshake timeout; any failure stops the
 engine. There is no self-healing: restart the whole group.
+
+With PD enabled, stage BINDs replace local placement and ordinary prefix
+negotiation. The PD runtime owns stage identity and frontend result retries.
 """
 
 from __future__ import annotations
@@ -53,6 +56,10 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdCloudParamsNotify,
     LwdEdgeToCloudMessage,
     LwdMessage,
+    LwdPdBindNotify,
+    LwdPdQuotaNotify,
+    LwdPdResultReceipt,
+    LwdPdStageDoneNotify,
     LwdPrefixReadyNotify,
     LwdRefillNotify,
     LwdRequestNotify,
@@ -81,12 +88,14 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     scheduler: LwdEdgeScheduler
 
     def _lwd_assemble(self) -> None:
+        self._lwd_pd = None
+        self._lwd_pd_enabled = self.lwd_config.pd.enabled
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
         )
         self._lwd_prefix_control = (
             LwdEdgePrefixControl(self, LWD_PREFIX_READY_TIMEOUT_S)
-            if self._lwd_prefix_enabled
+            if self._lwd_prefix_enabled and not self._lwd_pd_enabled
             else None
         )
         self._lwd_cloud_params: dict[LwdConnectionId, LwdCloudParamsNotify] = {}
@@ -98,6 +107,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.scheduler.lwd_on_finish = self._lwd_finish_request
         self.scheduler.lwd_has_pending = lambda: (
             self._lwd_probe_manager.pending
+            or bool(self._lwd_pd and self._lwd_pd.pending)
             or bool(self._lwd_prefix_control and self._lwd_prefix_control.pending)
         )
         self._lwd_cloud_params_received = threading.Event()
@@ -123,7 +133,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_cloud_params_received.clear()
         for dp_idx, params in self._lwd_cloud_params.items():
             self._lwd_check_cloud_params(dp_idx, params)
-        self._lwd_configure_prefix_cache()
+        if self._lwd_pd_enabled:
+            from vllm.v1.lwd_control.pd.edge_runtime import LwdPdEdgeRuntime
+
+            self._lwd_pd = LwdPdEdgeRuntime(self)
+            self._lwd_pd.validate_clouds()
+        else:
+            self._lwd_configure_prefix_cache()
         self._lwd_coord_clients: dict[LwdConnectionId, LwdCoordClient] = {
             dp_idx: LwdCoordClient(dp_idx.dp_idx, params.dp_coordinator_addr)
             for dp_idx, params in self._lwd_cloud_params.items()
@@ -178,6 +194,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self.scheduler._lwd_prefix_hash_block_size = control.hash_block_size
 
     def shutdown(self) -> None:
+        if getattr(self, "_lwd_pd", None) is not None:
+            self._lwd_pd.close()
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None:
             control.shutdown()
@@ -207,6 +225,19 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self.scheduler.lwd_update_cloud_params(connection, msg)
             self._lwd_cloud_params_received.set()
             return True
+        if isinstance(
+            msg,
+            (
+                LwdPdBindNotify,
+                LwdPdStageDoneNotify,
+                LwdPdQuotaNotify,
+                LwdPdResultReceipt,
+            ),
+        ):
+            self.input_queue.put_nowait(
+                (EngineCoreRequestType.WAKEUP, (self._lwd_connection_of(peer), msg))
+            )
+            return True
         if isinstance(msg, (LwdPrefixReadyNotify, LwdRefillNotify)):
             self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, msg))
             return True
@@ -229,6 +260,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         """(max_num_batched_tokens, max_num_seqs) must match every cloud DP
         rank: a mismatch makes the cloud hold prefills behind decodes forever
         without any error."""
+        if self._lwd_pd_enabled:
+            return
         sched = self.vllm_config.scheduler_config
         local = (sched.max_num_batched_tokens, sched.max_num_seqs)
         remote = (params.max_num_batched_tokens, params.max_num_seqs)
@@ -247,6 +280,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         """Send to one cloud DP rank, retrying a full outbound queue; raises
         once the retries run out instead of losing the message."""
         cloud = self._lwd_clouds[dp_idx]
+        if self._lwd_pd is not None:
+            self._lwd_pd.control_outbox.put(cloud, message, time.monotonic())
+            return
         for attempt in range(_LWD_SEND_RETRY_STEPS):
             if self._lwd_send(cloud, message):
                 return
@@ -268,6 +304,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         )
         if self.scheduler.lwd_edge_request_active(request.request_id):
             raise AssertionError(f"duplicate active request id: {request.request_id}")
+        if self._lwd_pd is not None:
+            self._lwd_pd.add(request)
+            return
         if request.abort_immediately:
             self._lwd_add_request_after_probe(request)
             return
@@ -301,6 +340,19 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
+        if self._lwd_pd is not None and request_type == EngineCoreRequestType.WAKEUP:
+            self._lwd_pd.tick()
+            if request == "lwd_pd_tick":
+                return
+        if (
+            self._lwd_pd is not None
+            and request_type == EngineCoreRequestType.WAKEUP
+            and isinstance(request, tuple)
+            and len(request) == 2
+            and isinstance(request[0], LwdConnectionId)
+            and self._lwd_pd.handle(*request)
+        ):
+            return
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None and control.handle_client_request(request_type, request):
             return
@@ -379,17 +431,23 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_add_request_after_probe(completion.request, completion)
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
+        if self._lwd_pd is not None:
+            self._lwd_pd.tick()
         self._lwd_drain_probe_completions()
         return super().step()
 
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
+        if self._lwd_pd is not None:
+            self._lwd_pd.tick()
         self._lwd_drain_probe_completions()
         return super().step_with_batch_queue()
 
     def abort_requests(self, request_ids: list[str]) -> None:
         """Notify each request's original cloud DP, then finish natively."""
+        if self._lwd_pd is not None:
+            self._lwd_pd.abort(request_ids)
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None:
             control.prepare_abort(request_ids)
@@ -397,7 +455,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             self._lwd_probe_manager.abort(request_id)
             self._lwd_probe_chains.pop(request_id, None)
         routed_aborts = self.scheduler.lwd_edge_abort(request_ids)
-        for dp_idx, request_id in routed_aborts:
+        for dp_idx, request_id in () if self._lwd_pd is not None else routed_aborts:
             request = self.scheduler.requests.get(request_id)
             self._lwd_send_to_cloud(
                 dp_idx,
@@ -433,7 +491,13 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
                         and self.lwd_config.coordination.placement_only
                     )
                 ),
-                prefix_hit_tokens=request.num_computed_tokens,
+                prefix_hit_tokens=getattr(
+                    request, "lwd_pd_hit_tokens", request.num_computed_tokens
+                ),
+                attempt_id=getattr(request, "lwd_pd_attempt_id", ""),
+                binding_id=getattr(request, "lwd_pd_binding_id", ""),
+                stage_role=getattr(request, "lwd_pd_stage_role", ""),
+                fingerprint=getattr(request, "lwd_pd_fingerprint", ""),
                 prefix_probe_succeeded=getattr(
                     request, "lwd_prefix_probe_succeeded", False
                 ),
@@ -449,5 +513,21 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             ),
         )
 
+    def lwd_pd_finalize(
+        self,
+        request_id: str,
+        attempt_id: str,
+        accepted_tokens: int,
+        frontend_reason: str,
+        cancel_execution: bool,
+    ) -> bool:
+        if self._lwd_pd is None:
+            raise ValueError("PD finalization called on a non-PD edge")
+        return self._lwd_pd.finalize(
+            request_id, attempt_id, accepted_tokens, frontend_reason, cancel_execution
+        )
+
     def _lwd_finish_request(self, request: Request) -> None:
+        if self._lwd_pd is not None:
+            self._lwd_pd.release(request.request_id)
         self._lwd_probe_chains.pop(request.request_id, None)
