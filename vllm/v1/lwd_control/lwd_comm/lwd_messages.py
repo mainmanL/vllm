@@ -21,7 +21,11 @@ T = TypeVar("T")
 # Version 5: LwdRequestNotify carries `structured_outputs`. An old cloud would
 # drop the constraint silently (msgspec skips unknown fields on decode), so
 # mixed versions fail the handshake instead of serving unstructured output.
-LWD_MESSAGE_VERSION = 5
+# Version 6: LwdRequestNotify carries `extra_args`. An old cloud would decode
+# the request but rebuild `SamplingParams` without the trusted scheme-3.1
+# backend route keys, so its grammar gate would reject the first rewritten
+# constraint at runtime; the handshake fails earlier instead.
+LWD_MESSAGE_VERSION = 6
 
 LWD_NOT_FINISHED = -1
 """`LwdC2eNotify.finish_reasons` value of a request still running."""
@@ -104,7 +108,14 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     """`lwd_encode_structured_outputs` wire JSON of the validated
     `StructuredOutputsParams`; empty for a plain request. The cloud rebuilds
     the params, compiles the grammar and applies the sampling bitmask; the
-    edge compiles its own copy only for the picker's grammar-ready filter."""
+    edge compiles its own copy only for the picker's grammar-ready filter.
+    Under scheme 3.1 the edge rewrites the constraint spec before this
+    encoding, so the wire form is already obfuscated."""
+    extra_args: dict[str, Any] | None = None
+    """`SamplingParams.extra_args` of the request. Native deployments leave
+    it unset; a scheme-3.1 edge rewriter stores the trusted backend route
+    keys here so the cloud's grammar gate can check the binding before
+    compiling the obfuscated constraint."""
     reasoning_ended: bool | None = None
     """Initial reasoning-ended state computed by the edge frontend; the cloud
     seeds its grammar gate from this instead of defaulting to thinking=True."""
@@ -190,10 +201,13 @@ LWD_SAMPLING_FIELDS: tuple[tuple[str, object], ...] = (
     ("ignore_eos", False),
     ("stop_token_ids", []),
     ("min_tokens", 0),
+    ("extra_args", None),
 )
 """(field, default) of the `SamplingParams` arguments `LwdRequestNotify`
 carries; the edge packs and the cloud rebuilds them from this one table.
-`eos_token_id` is not a `SamplingParams` argument and travels on its own."""
+`eos_token_id` is not a `SamplingParams` argument and travels on its own.
+`extra_args` stays unset for native requests and carries the scheme-3.1
+trusted route keys when the edge rewriter is active."""
 LWD_SAMPLING_DEFAULTS = dict(LWD_SAMPLING_FIELDS)
 
 
