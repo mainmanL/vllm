@@ -140,9 +140,21 @@ class MultiModalRegistry:
         tokenizer: TokenizerLike | None = None,
     ) -> BaseProcessingInfo:
         model_cls = self._get_model_cls(model_config)
-        factories = model_cls._processor_factory
         ctx = self._create_processing_ctx(model_config, tokenizer)
+        factories = self._resolve_processor_factories(model_cls, ctx)
         return factories.info(ctx)
+
+    @staticmethod
+    def _resolve_processor_factories(model_cls, ctx):
+        # A processed-input tokenizer may supply startup budget/dummy metadata
+        # without constructing a text-aware HF media processor in this process.
+        # Normal tokenizers have no hook and retain the original model factory.
+        hook = getattr(ctx.tokenizer, "create_multimodal_processor_factory", None)
+        if hook is not None:
+            selected = hook(ctx)
+            if selected is not None:
+                return selected
+        return model_cls._processor_factory
 
     def get_processing_info(self, model_config: "ModelConfig") -> BaseProcessingInfo:
         return self._create_processing_info(model_config, tokenizer=None)
@@ -159,9 +171,8 @@ class MultiModalRegistry:
             raise ValueError(f"{model_name} is not a multimodal model")
 
         model_cls = self._get_model_cls(model_config)
-        factories = model_cls._processor_factory
-
         ctx = self._create_processing_ctx(model_config, tokenizer)
+        factories = self._resolve_processor_factories(model_cls, ctx)
 
         return factories.build_processor(ctx)
 
