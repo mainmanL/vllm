@@ -498,6 +498,9 @@ class EngineArgs:
     skip_tokenizer_init: bool = ModelConfig.skip_tokenizer_init
     enable_prompt_embeds: bool = ModelConfig.enable_prompt_embeds
     tokenizer_mode: TokenizerMode | str = ModelConfig.tokenizer_mode
+    enable_tokenizer_obfuscation: bool | None = None
+    tokenizer_obfuscation_artifacts: str | None = None
+    tokenizer_obfuscation_debug_ti_validation: bool = False
     trust_remote_code: bool = ModelConfig.trust_remote_code
     allowed_local_media_path: str = ModelConfig.allowed_local_media_path
     allowed_media_domains: list[str] | None = ModelConfig.allowed_media_domains
@@ -968,6 +971,27 @@ class EngineArgs:
         model_group.add_argument("--convert", **model_kwargs["convert"])
         model_group.add_argument("--tokenizer", **model_kwargs["tokenizer"])
         model_group.add_argument("--tokenizer-mode", **model_kwargs["tokenizer_mode"])
+        model_group.add_argument(
+            "--enable-tokenizer-obfuscation",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Load and bind trusted mixed-tokenizer deployment artifacts.",
+        )
+        model_group.add_argument(
+            "--tokenizer-obfuscation-artifacts",
+            default=None,
+            help="Path to the manually transferred mixed-tokenizer manifest.",
+        )
+        model_group.add_argument(
+            "--tokenizer-obfuscation-debug-ti-validation",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help=(
+                "Enable full TokenizerInfo diagnostics for an already enabled "
+                "mixed-tokenizer service. This runtime-only switch does not "
+                "enable obfuscation or change deployment artifact identity."
+            ),
+        )
         model_group.add_argument(
             "--trust-remote-code", **model_kwargs["trust_remote_code"]
         )
@@ -1968,6 +1992,11 @@ class EngineArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        from vllm.utils.tokenizer_obfuscation import run_obfuscation_hook
+
+        # Frontend-only tool and middleware settings must be resolved before
+        # copying the engine fields and before API workers are spawned.
+        run_obfuscation_hook("configure_server_args", args)
         # Get the list of attributes of this dataclass.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
 
@@ -1975,6 +2004,11 @@ class EngineArgs:
         engine_args = cls(
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
         )
+        # Preserve only this bridge's private binding state. It includes the
+        # original frontend options needed to validate the deployed manifest.
+        for name, value in vars(args).items():
+            if name.startswith("_tokenizer_obfuscation_"):
+                setattr(engine_args, name, value)
         return engine_args
 
     def create_model_config(self) -> ModelConfig:
@@ -2284,6 +2318,11 @@ class EngineArgs:
                 )
             )
 
+        from vllm.utils.tokenizer_obfuscation import run_obfuscation_hook
+
+        # Bind the tokenizer before ModelConfig/ReasoningConfig can initialize
+        # tokenizers. The final hook below checks native resolved defaults.
+        run_obfuscation_hook("configure_engine_args", self)
         model_config = self.create_model_config()
         self.model = model_config.model
         self.model_weights = model_config.model_weights
@@ -2936,6 +2975,7 @@ class EngineArgs:
             shutdown_timeout=self.shutdown_timeout,
         )
 
+        run_obfuscation_hook("validate_engine_config", self, config)
         return config
 
     def _check_feature_supported(self):
