@@ -1226,6 +1226,26 @@ class SamplingParams(
     ) -> None:
         if structured_outputs_config is None or self.structured_outputs is None:
             return
+        from vllm.utils.tokenizer_obfuscation import (
+            validate_structured_outputs_with_route,
+        )
+
+        validate_structured_outputs_with_route(
+            self,
+            model_config,
+            structured_outputs_config,
+            tokenizer,
+            self._validate_structured_outputs_native,
+        )
+
+    def _validate_structured_outputs_native(
+        self,
+        model_config: ModelConfig,
+        structured_outputs_config: StructuredOutputsConfig | None,
+        tokenizer: TokenizerLike | None,
+    ) -> None:
+        if structured_outputs_config is None or self.structured_outputs is None:
+            return
 
         if model_config.is_diffusion:
             # Diffusion LLMs denoise a whole canvas of tokens in parallel
