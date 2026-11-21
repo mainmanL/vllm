@@ -157,6 +157,12 @@ class GuidanceBackend(StructuredOutputBackend):
 
     @staticmethod
     def _build_ll_tokenizer(tokenizer: TokenizerLike, vocab_size: int) -> Any:
+        if callable(
+            init_tokenizer := getattr(tokenizer, "init_guidance_tokenizer", None)
+        ):
+            # Transport tokenizers may expose carrier strings to HF. Use their
+            # actual grammar bytes while retaining native Guidance matching.
+            return init_tokenizer(vocab_size)
         if is_mistral_tokenizer(tokenizer):
             return tokenizer.llg_tokenizer
         return llguidance_hf.from_tokenizer(tokenizer, max(vocab_size, len(tokenizer)))
