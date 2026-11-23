@@ -1,0 +1,90 @@
+{
+  "tool": "lwd_source_encryption_poc",
+  "description": "Static AES-256-GCM source protection PoC for two LWD modules. Every path here is repository-relative; no local absolute path is stored. `build` fills the plaintext/payload hashes.",
+  "format_version": 1,
+  "cipher": "AES-256-GCM",
+  "nonce_bytes": 12,
+  "key_file": "runtime_key.b64",
+  "key_policy": "static protection PoC key shipped with the tool; NOT a long-term secret (see README section 3)",
+  "repositories": {
+    "vllm": {
+      "package": "vllm"
+    },
+    "vllm-ascend": {
+      "package": "vllm_ascend"
+    }
+  },
+  "modules": [
+    {
+      "module": "vllm.v1.lwd_control.lwd_comm.lwd_control_plane",
+      "repository": "vllm",
+      "source": "vllm/v1/lwd_control/lwd_comm/lwd_control_plane.py",
+      "payload": "vllm/v1/lwd_control/lwd_comm/lwd_control_plane.py.lwdc",
+      "plaintext_sha256": "43af7944e8b329cf9c8866153d44870bf0b2f66a91afdaf56c18da93e6670790",
+      "plaintext_bytes": 32138,
+      "payload_bytes": 32234,
+      "payload_sha256": "2fabea45e9afd598289dc3084115ce05d83c29ed7cdd9135e9b5c616656deece",
+      "canary_line_sha256": [
+        "7b34155750c8a5760a42d30f89f56cb733b3501b221153d0189181c4025f1df3",
+        "e5eabee6999889e66368d0b4f4e5c8d1a01e0f18153f8658fb37d1e76b75c2fd",
+        "82d8ecff9c2a56e4d946693290369707185b46b2de69e289dfcfc53ed53f7290",
+        "f51a51e9dc0ed9af90517e8259969c8b3eeb6e4b954d037b5d9245426b79ff1f",
+        "06d4ceb4caed59a7d998228899b9b1d858e9d5ee73d9a12119ba7d9bfac635eb",
+        "2d8843f7c7b53970a21729d82f342e1919a914708cad707d4078287f4e3eb52c",
+        "37fcf68d5467c1bf7d33ac742038caf462f660799a074828d1b444f5f41278d7",
+        "322c92734baf7b36fbbdedc157461ba30dfdce00065f2f11c27c751473933305"
+      ]
+    },
+    {
+      "module": "vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue",
+      "repository": "vllm-ascend",
+      "source": "vllm_ascend/distributed/lwd_data_plane/lwd_transfer_queue.py",
+      "payload": "vllm_ascend/distributed/lwd_data_plane/lwd_transfer_queue.py.lwdc",
+      "plaintext_sha256": "71790e4d859d73b98bdcf812f0ebaf624ce3148feaa238b19d9905a140206737",
+      "plaintext_bytes": 24271,
+      "payload_bytes": 24378,
+      "payload_sha256": "8571d7dda3aff074e6ac0016627d5434c34c2f837d43c71f6ebffbdbafbf9981",
+      "canary_line_sha256": [
+        "2784188227f60a560bf23fb153d73d1012397dcf0876f5dd9979c6a68f2be4a1",
+        "73947cf2d162d3206d6cc1a4ea34c7bed332008480b76226f494d3b3ab7a5146",
+        "911066c0d8223a511628a98944c1ea415c527a748f0702514d9df53d928dce9e",
+        "b996316f3280a41040c67cf1306c8e4db69037a71bdc5a0d7ae97a6688753c9a",
+        "bda7c9dc3fcb5d421303e22672ef7309ea71a59c28829c61e3c8ad41724ddc85",
+        "e5097d117fe158c89a9f84657706d52c4dd4631a6ca34e9e1d847de11dddf534",
+        "90208803775760aed527ff7bfea39610cd160453e2e98c52eecbac4c02298230",
+        "3afccdd08b039932514f169f3b74f36b80de0cd6d2dd5cfe031aa6d82f41ef5a"
+      ]
+    }
+  ],
+  "verification": {
+    "module_attributes": {
+      "vllm.v1.lwd_control.lwd_comm.lwd_control_plane": [
+        "LwdControlPlane",
+        "LwdControlPlane.start",
+        "LwdControlPlane.shutdown",
+        "LwdEdgeControlPlane",
+        "LwdCloudControlPlane",
+        "LwdControlSender",
+        "LwdControlSender.send",
+        "LwdControlListener",
+        "LwdPeerNotRegisteredError"
+      ],
+      "vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue": [
+        "LwdTransferQueue",
+        "LwdTransferQueue.submit",
+        "LwdTransferQueue.reap",
+        "LwdTransferQueue.abort",
+        "LwdTransferQueue.shutdown",
+        "lwd_scramble_seed_for"
+      ]
+    },
+    "subclass_checks": [
+      {
+        "module": "vllm_ascend.distributed.lwd_data_plane.host.lwd_host_transfer_queue",
+        "class_name": "LwdHostTransferQueue",
+        "base_module": "vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue",
+        "base_class": "LwdTransferQueue"
+      }
+    ]
+  }
+}
