@@ -375,18 +375,6 @@ class LwdEdgeGPUModelRunner(LwdBaseGPUModelRunner):
         for req_id in finished_req_ids:
             self._lwd_engram_prompts.pop(req_id, None)
 
-    def _lwd_trace_replay(
-        self,
-        seqno: int,
-        logits: torch.Tensor,
-        selected_ids: list[int],
-        ranks: list[int],
-        req_ids: list[str],
-        hidden_states: torch.Tensor | None = None,
-    ) -> None:
-        """Platform-specific diagnostics; replay production never reads token IDs."""
-        pass
-
     @torch.inference_mode()
     def execute_lwd_unembed(
         self, seqno: int, batch_meta: LwdUnembedBatch
@@ -425,19 +413,8 @@ class LwdEdgeGPUModelRunner(LwdBaseGPUModelRunner):
         # interface present on both wrapper and monolithic models.
         logits = model.compute_logits(hidden_states)  # (rows_total, V)
         _t_lm = time.monotonic()
-        flat_ranks = [r for ranks in batch_meta.top_id_ths for r in ranks]
-        flat_ids = select_token_batch(logits, flat_ranks)
-        self._lwd_trace_replay(
-            seqno,
-            logits,
-            flat_ids,
-            flat_ranks,
-            [
-                req_id
-                for req_id, ranks in zip(batch_meta.req_ids, batch_meta.top_id_ths)
-                for _ in ranks
-            ],
-            hidden_states=hidden_states,
+        flat_ids = select_token_batch(
+            logits, [r for ranks in batch_meta.top_id_ths for r in ranks]
         )
         sampled_token_ids = []
         off = 0
