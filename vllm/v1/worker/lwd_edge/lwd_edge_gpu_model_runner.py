@@ -382,6 +382,7 @@ class LwdEdgeGPUModelRunner(LwdBaseGPUModelRunner):
         selected_ids: list[int],
         ranks: list[int],
         req_ids: list[str],
+        hidden_states: torch.Tensor | None = None,
     ) -> None:
         """Platform-specific diagnostics; replay production never reads token IDs."""
         pass
@@ -436,6 +437,7 @@ class LwdEdgeGPUModelRunner(LwdBaseGPUModelRunner):
                 for req_id, ranks in zip(batch_meta.req_ids, batch_meta.top_id_ths)
                 for _ in ranks
             ],
+            hidden_states=hidden_states,
         )
         sampled_token_ids = []
         off = 0
