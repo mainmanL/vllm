@@ -409,9 +409,9 @@ class LwdEdgeGPUModelRunner(LwdBaseGPUModelRunner):
             )
         )
         _t_post = time.monotonic()
-        # wait_on_current_stream: device-ordered wait; the host never blocks
-        recv_future.wait_on_current_stream()
-        result = recv_future.result()
+        # Complete this receive before consuming its buffer. A stream-only
+        # wait can otherwise expose the previous occupant of a reused buffer.
+        result = recv_future.wait()
         # The receive tensor was allocated on the channel stream but is
         # consumed by lm_head on the compute stream. Keep its allocation
         # alive until that stream's work completes, including after the

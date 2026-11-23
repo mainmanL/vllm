@@ -7,7 +7,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner import select_token_batch
+from vllm.v1.core.sched.output import LwdUnembedBatch
+from vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner import (
+    LwdEdgeGPUModelRunner,
+    select_token_batch,
+)
 from vllm.v1.worker.lwd_edge.lwd_edge_worker import LwdEdgeWorker
 
 
@@ -16,6 +20,57 @@ def test_rank_replay_uses_stable_token_id_order_for_equal_logits() -> None:
 
     assert select_token_batch(logits, [0, 1]) == [0, 2]
     assert select_token_batch(logits, [1, 0]) == [1, 1]
+
+
+def test_unembed_waits_for_receive_completion_before_lm_head() -> None:
+    class IncompleteFuture:
+        def __init__(self) -> None:
+            self.completed = False
+            self.wait_calls = 0
+            self.tensor = torch.tensor([[1.0, 3.0], [2.0, 4.0]])
+            self.tensor.record_stream = lambda stream: None
+
+        def wait_on_current_stream(self) -> None:
+            pass
+
+        def result(self) -> SimpleNamespace:
+            if not self.completed:
+                raise RuntimeError("receive buffer was read before completion")
+            return SimpleNamespace(tensor=self.tensor)
+
+        def wait(self) -> SimpleNamespace:
+            self.wait_calls += 1
+            self.completed = True
+            return self.result()
+
+    future = IncompleteFuture()
+    runner = object.__new__(LwdEdgeGPUModelRunner)
+    runner.worker = SimpleNamespace(
+        comm_service=SimpleNamespace(submit_recv=lambda request: future)
+    )
+    runner.model_config = SimpleNamespace(get_hidden_size=lambda: 2)
+    runner._lwd_up_send_inflight = {}
+    runner._lwd_up_send_watermarks = {}
+    model = SimpleNamespace(compute_logits=lambda hidden_states: hidden_states)
+    batch = LwdUnembedBatch(
+        req_ids=["request-a"],
+        num_accept_tokens=[2],
+        recv_num_elements=4,
+        top_id_ths=[[0, 0]],
+    )
+
+    with (
+        patch.object(runner, "get_model", return_value=model),
+        patch(
+            "vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner."
+            "torch.accelerator.current_stream",
+            return_value=object(),
+        ),
+    ):
+        output = runner.execute_lwd_unembed(0, batch)
+
+    assert future.wait_calls == 1
+    assert output.sampled_token_ids == [[1, 1]]
 
 
 def test_gpu_worker_uses_host_ucx_without_native_warmup() -> None:
