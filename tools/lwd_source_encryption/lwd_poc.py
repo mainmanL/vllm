@@ -160,22 +160,60 @@ def _ensure_writable_dir(path: Path) -> None:
     os.unlink(probe)
 
 
-def _resolve_manifest(args: argparse.Namespace) -> Path:
-    path = Path(args.manifest).resolve() if args.manifest else DEFAULT_MANIFEST
-    if not path.is_file():
-        raise runtime.LwdSourceProtectionError(
-            f"manifest {path} does not exist; create it or pass --manifest"
-        )
-    return path
+def _bundled_manifest(*, allow_unbuilt: bool = False) -> dict[str, Any] | None:
+    """Return the manifest inlined by the single-file bundle, if any."""
+    value = globals().get("MANIFEST_JSON")
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            manifest = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise runtime.LwdSourceProtectionError(
+                f"inlined manifest is not valid JSON: {exc}"
+            ) from exc
+    else:
+        manifest = value
+    runtime.validate_manifest(manifest, source="inlined manifest",
+                              allow_unbuilt=allow_unbuilt)
+    return manifest
+
+
+def _load_manifest_source(
+    args: argparse.Namespace, *, allow_unbuilt: bool = False
+) -> tuple[dict[str, Any], Path | None]:
+    """Load the manifest from --manifest, the tool directory, or the bundle.
+
+    The inlined copy is authoritative for a packaged launcher; the file paths
+    are the local-development fallback.
+    """
+    if getattr(args, "manifest", None):
+        path = Path(args.manifest).resolve()
+        if not path.is_file():
+            raise runtime.LwdSourceProtectionError(
+                f"manifest {path} does not exist; create it or pass --manifest"
+            )
+        return runtime.load_manifest(path, allow_unbuilt=allow_unbuilt), path
+    if DEFAULT_MANIFEST.is_file():
+        return (runtime.load_manifest(DEFAULT_MANIFEST,
+                                      allow_unbuilt=allow_unbuilt),
+                DEFAULT_MANIFEST)
+    manifest = _bundled_manifest(allow_unbuilt=allow_unbuilt)
+    if manifest is not None:
+        return manifest, None
+    raise runtime.LwdSourceProtectionError(
+        f"manifest {DEFAULT_MANIFEST} does not exist and this tool carries no "
+        "inlined manifest; pass --manifest"
+    )
 
 
 def _resolve_key(
-    args: argparse.Namespace, manifest_path: Path, manifest: dict[str, Any]
+    args: argparse.Namespace, manifest_path: Path | None, manifest: dict[str, Any]
 ) -> Path:
     if getattr(args, "key", None):
         return Path(args.key).resolve()
     declared = manifest.get("key_file")
-    if isinstance(declared, str) and declared:
+    if manifest_path is not None and isinstance(declared, str) and declared:
         runtime.validate_relative_path(declared, "manifest.key_file")
         return (manifest_path.parent / PurePosixPath(declared)).resolve()
     return DEFAULT_KEY
@@ -445,25 +483,35 @@ def _build_module(
 
 
 def _write_manifest(
-    manifest: dict[str, Any], manifest_path: Path, key_path: Path
+    manifest: dict[str, Any], manifest_path: Path, key_path: Path | None
 ) -> None:
-    if key_path.parent == manifest_path.parent:
-        manifest["key_file"] = key_path.name
-    else:
-        manifest.pop("key_file", None)
+    if key_path is not None:
+        if key_path.parent == manifest_path.parent:
+            manifest["key_file"] = key_path.name
+        else:
+            manifest.pop("key_file", None)
     text = json.dumps(manifest, indent=2) + "\n"
     _write_text_atomic(manifest_path, text)
 
 
 def cmd_build(args: argparse.Namespace) -> int:
-    manifest_path = _resolve_manifest(args)
-    manifest = runtime.load_manifest(manifest_path, allow_unbuilt=True)
+    manifest, manifest_path = _load_manifest_source(args, allow_unbuilt=True)
+    if manifest_path is None:
+        raise runtime.LwdSourceProtectionError(
+            "build needs a manifest file; the inlined bundle manifest is "
+            "read-only (pass --manifest from a local checkout)"
+        )
     roots = _repository_roots(args, manifest)
     _ensure_cryptography()
-    key_path = _resolve_key(args, manifest_path, manifest)
-    key, created = _load_or_create_key(key_path)
-    if created:
-        _log(f"generated AES-256 key: {key_path}")
+    key = runtime.load_key_from_env()
+    if key is not None:
+        key_path = None
+        _log("[build] using LWD_SOURCE_KEY_B64 (no key file is written)")
+    else:
+        key_path = _resolve_key(args, manifest_path, manifest)
+        key, created = _load_or_create_key(key_path)
+        if created:
+            _log(f"generated AES-256 key: {key_path}")
     context = _BuildContext(roots=roots, key=key, force=bool(args.force))
     plaintexts: dict[str, bytes | None] = {}
     for entry in manifest["modules"]:
@@ -512,8 +560,9 @@ class _InstallPlan:
     config: dict[str, Any]
     records: dict[str, runtime.ProtectedModule]
     manifest: dict[str, Any]
-    manifest_path: Path
-    key_path: Path
+    manifest_path: Path | None
+    key_path: Path | None
+    key_source: str
     python: str
 
 
@@ -549,10 +598,16 @@ def _check_package_root(package: str, root: Path) -> None:
 
 
 def _preflight(args: argparse.Namespace) -> _InstallPlan:
-    manifest_path = _resolve_manifest(args)
-    manifest = runtime.load_manifest(manifest_path)
-    key_path = _resolve_key(args, manifest_path, manifest)
-    key = runtime.load_key_file(key_path)
+    manifest, manifest_path = _load_manifest_source(args)
+    env_key = runtime.load_key_from_env()
+    if env_key is not None:
+        key = env_key
+        key_source = "env"
+        key_path = None
+    else:
+        key_path = _resolve_key(args, manifest_path, manifest)
+        key = runtime.load_key_file(key_path)
+        key_source = "file"
     _ensure_cryptography()
     roots = _repository_roots(args, manifest)
     for name, repository in manifest["repositories"].items():
@@ -578,11 +633,19 @@ def _preflight(args: argparse.Namespace) -> _InstallPlan:
     config = {
         "tool": runtime.TOOL_NAME,
         "format_version": runtime.FORMAT_VERSION,
-        "manifest_path": str(manifest_path),
-        "key_path": str(key_path),
         "repositories": {name: str(Path(root)) for name, root in roots.items()},
         "modules": [entry["module"] for entry in manifest["modules"]],
     }
+    if manifest_path is not None:
+        config["manifest_path"] = str(manifest_path)
+    else:
+        # Packaged launcher: no cache or temporary path is recorded, the
+        # manifest travels inline in the configuration.
+        config["manifest"] = manifest
+    if key_source == "env":
+        config["key_source"] = "env"
+    else:
+        config["key_path"] = str(key_path)
     return _InstallPlan(
         purelib=purelib,
         config=config,
@@ -590,12 +653,17 @@ def _preflight(args: argparse.Namespace) -> _InstallPlan:
         manifest=manifest,
         manifest_path=manifest_path,
         key_path=key_path,
+        key_source=key_source,
         python=python,
     )
 
 
 def _apply_install(plan: _InstallPlan) -> tuple[list[Path], list[Path]]:
-    runtime_source = (_TOOL_DIR / runtime.RUNTIME_FILENAME).read_bytes()
+    bundled_source = getattr(runtime, "__bundled_source__", None)
+    if bundled_source is not None:
+        runtime_source = bundled_source.encode("utf-8")
+    else:
+        runtime_source = (_TOOL_DIR / runtime.RUNTIME_FILENAME).read_bytes()
     if runtime.RUNTIME_MARKER.encode() not in runtime_source:
         raise runtime.LwdSourceProtectionError(
             f"{_TOOL_DIR / runtime.RUNTIME_FILENAME} is not the "
@@ -994,7 +1062,11 @@ def _probe_data(plan: _InstallPlan) -> dict[str, Any]:
     }
 
 
-def _run_probe(plan: _InstallPlan, label: str) -> dict[str, Any]:
+def _run_probe(
+    plan: _InstallPlan,
+    label: str,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
     workdir = Path(tempfile.mkdtemp(prefix=f"lwd_poc_{label}_"))
     try:
         script = workdir / "lwd_source_protection_probe.py"
@@ -1009,6 +1081,7 @@ def _run_probe(plan: _InstallPlan, label: str) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=900,
+            env=env,
         )
         if not output.is_file():
             raise runtime.LwdSourceProtectionError(
@@ -1168,9 +1241,37 @@ def _tamper_checks(
     return checks
 
 
+def _no_env_failure(plan: _InstallPlan) -> tuple[bool, str]:
+    """Import a protected module in a fresh interpreter without the key env."""
+    env = dict(os.environ)
+    env.pop(runtime.KEY_ENV_VAR, None)
+    module = next(iter(plan.records))
+    program = (
+        "import importlib\n"
+        "import sys\n"
+        "import lwd_source_runtime as runtime\n"
+        "try:\n"
+        "    runtime.install()\n"
+        "    importlib.import_module(" + repr(module) + ")\n"
+        "except BaseException as exc:\n"
+        "    print(type(exc).__name__ + ': ' + str(exc), file=sys.stderr)\n"
+        "    raise SystemExit(3)\n"
+        "raise SystemExit(0)\n"
+    )
+    completed = subprocess.run(
+        [plan.python, "-c", program],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+    detail = (completed.stderr or completed.stdout).strip().splitlines()
+    message = detail[-1] if detail else f"exit {completed.returncode}"
+    return completed.returncode == 3 and runtime.KEY_ENV_VAR in message, message
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
-    manifest_path = _resolve_manifest(args)
-    manifest = runtime.load_manifest(manifest_path)
+    manifest, manifest_path = _load_manifest_source(args)
     roots = _repository_roots(args, manifest)
     checks = _static_checks(manifest, roots)
     try:
@@ -1193,6 +1294,37 @@ def cmd_verify(args: argparse.Namespace) -> int:
             f"{len(written)} file(s) written, {len(removed)} stale pyc removed",
         )
     )
+    env_value = os.environ.get(runtime.KEY_ENV_VAR, "").strip()
+    expected_source = "env" if env_value else "file"
+    checks.append(
+        (
+            "install.key_source",
+            plan.key_source == expected_source,
+            f"{plan.key_source} (key env {'set' if env_value else 'unset'})",
+        )
+    )
+    config_text = (
+        plan.purelib / runtime.CONFIG_FILENAME
+    ).read_text(encoding="utf-8")
+    checks.append(
+        (
+            "install.config_has_no_key",
+            not env_value or env_value not in config_text,
+            "configuration does not contain the key",
+        )
+    )
+    if plan.key_source == "env":
+        key_files = [plan.purelib / runtime.KEY_FILENAME]
+        if plan.manifest_path is not None:
+            key_files.append(plan.manifest_path.parent / runtime.KEY_FILENAME)
+        present = [str(path) for path in key_files if path.exists()]
+        checks.append(
+            (
+                "disk.key_file_absent",
+                not present,
+                ", ".join(present) or "no runtime_key.b64 on disk",
+            )
+        )
     try:
         report = _run_probe(plan, "verify")
     except (
@@ -1204,6 +1336,18 @@ def cmd_verify(args: argparse.Namespace) -> int:
         checks.append(("probe.run", False, str(exc)))
     else:
         checks.extend(_probe_checks(report))
+    if plan.key_source == "env":
+        try:
+            failed, message = _no_env_failure(plan)
+        except (
+            runtime.LwdSourceProtectionError,
+            OSError,
+            ValueError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            checks.append(("runtime.no_env", False, str(exc)))
+        else:
+            checks.append(("runtime.no_env", failed, message))
     if args.tamper:
         try:
             checks.extend(_tamper_checks(plan, manifest))

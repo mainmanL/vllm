@@ -15,9 +15,15 @@ and is never written back to disk.  Nothing patches ``open``, ``inspect``,
 ``linecache`` or CPython: the loader implements the standard loader protocol,
 so ``inspect.getsource`` and ``linecache`` keep working.
 
+The key comes from ``LWD_SOURCE_KEY_B64`` when the launcher provides it (the
+single-file launcher exports the raw key this way) and otherwise falls back to
+the local-development key file.  A present but invalid environment value is
+fail-closed: it never falls back to the file.
+
 This is a static-protection PoC, not a secret-keeping mechanism: the key is
-shipped next to the tool and ``loader.get_source()`` returns plaintext by
-design (the accepted boundary, see ``README.md``).
+visible in the process environment (``/proc/<pid>/environ``) and
+``loader.get_source()`` returns plaintext by design (the accepted boundary, see
+``README.md``).
 """
 
 from __future__ import annotations
@@ -48,7 +54,10 @@ __all__ = [
     "decrypt_source",
     "encrypt_source",
     "install",
+    "KEY_ENV_VAR",
+    "load_key",
     "load_key_file",
+    "load_key_from_env",
     "load_manifest",
     "load_runtime_config",
     "pack_payload",
@@ -59,6 +68,8 @@ __all__ = [
 TOOL_NAME = "lwd_source_encryption_poc"
 MANIFEST_FILENAME = "manifest.json"
 KEY_FILENAME = "runtime_key.b64"
+KEY_ENV_VAR = "LWD_SOURCE_KEY_B64"
+KEY_SOURCES = frozenset({"env"})
 RUNTIME_FILENAME = "lwd_source_runtime.py"
 CONFIG_FILENAME = "lwd_source_protection.json"
 PTH_FILENAME = "lwd_source_protection.pth"
@@ -477,6 +488,49 @@ def load_key_file(path: Path) -> bytes:
     return key
 
 
+def load_key_from_env() -> bytes | None:
+    """Decode the key the launcher exports through ``LWD_SOURCE_KEY_B64``.
+
+    Returns ``None`` when the variable is unset, so callers can fall back to the
+    key-file workflow used for local development and ``build``.  A variable that
+    is present but empty, not base64, or not 32 bytes raises: silently ignoring
+    it would select another key source and hide a broken deployment.
+    """
+    raw = os.environ.get(KEY_ENV_VAR)
+    if raw is None:
+        return None
+    compact = "".join(raw.split())
+    if not compact:
+        raise LwdSourceProtectionError(
+            f"environment variable {KEY_ENV_VAR} is set but empty"
+        )
+    try:
+        key = base64.b64decode(compact, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise LwdSourceProtectionError(
+            f"environment variable {KEY_ENV_VAR} is not valid base64: {exc}"
+        ) from exc
+    if len(key) != AES_KEY_BYTES:
+        raise LwdSourceProtectionError(
+            f"environment variable {KEY_ENV_VAR} must decode to "
+            f"{AES_KEY_BYTES} bytes, got {len(key)}"
+        )
+    return key
+
+
+def load_key(key_path: Path | None = None) -> bytes:
+    """Return the runtime key: environment first, then the local key file."""
+    key = load_key_from_env()
+    if key is not None:
+        return key
+    if key_path is not None:
+        return load_key_file(Path(key_path))
+    raise LwdSourceProtectionError(
+        f"no runtime key available: set {KEY_ENV_VAR} (the lwd_source_poc "
+        "launcher does this) or provide a key file"
+    )
+
+
 def load_runtime_config(path: Path) -> dict[str, Any]:
     """Load and validate the installed runtime configuration."""
     try:
@@ -500,10 +554,37 @@ def load_runtime_config(path: Path) -> dict[str, Any]:
         raise LwdSourceProtectionError(
             f"{path}: unsupported format_version {data.get('format_version')!r}"
         )
-    for key in ("manifest_path", "key_path"):
-        value = _require_str(data.get(key), f"{path}: {key}")
-        if not os.path.isabs(value):
-            raise LwdSourceProtectionError(f"{path}: {key} must be absolute")
+    manifest_path = data.get("manifest_path")
+    if manifest_path is not None:
+        manifest_path = _require_str(manifest_path, f"{path}: manifest_path")
+        if not os.path.isabs(manifest_path):
+            raise LwdSourceProtectionError(
+                f"{path}: manifest_path must be absolute"
+            )
+    inline_manifest = data.get("manifest")
+    if inline_manifest is not None:
+        validate_manifest(inline_manifest, source=f"{path}: manifest")
+    if manifest_path is None and inline_manifest is None:
+        raise LwdSourceProtectionError(
+            f"{path}: must declare manifest_path or an inline manifest"
+        )
+
+    key_source = data.get("key_source")
+    if key_source is not None:
+        key_source = _require_str(key_source, f"{path}: key_source")
+        if key_source not in KEY_SOURCES:
+            raise LwdSourceProtectionError(
+                f"{path}: unsupported key_source {key_source!r}"
+            )
+    key_path = data.get("key_path")
+    if key_path is not None:
+        key_path = _require_str(key_path, f"{path}: key_path")
+        if not os.path.isabs(key_path):
+            raise LwdSourceProtectionError(f"{path}: key_path must be absolute")
+    if key_source is None and key_path is None:
+        raise LwdSourceProtectionError(
+            f"{path}: must declare key_source or key_path"
+        )
     repositories = _require_mapping(data.get("repositories"), f"{path}: repositories")
     for name, value in repositories.items():
         text_root = _require_str(value, f"{path}: repositories[{name!r}]")
@@ -809,6 +890,25 @@ def _unregister_finder(finder_type: type[LwdSourceProtectionFinder]) -> None:
     ]
 
 
+def _config_key(config: dict[str, Any]) -> bytes:
+    key = load_key_from_env()
+    if key is not None:
+        return key
+    if config.get("key_source") == "env":
+        raise LwdSourceProtectionError(
+            f"runtime key source is 'env' but {KEY_ENV_VAR} is not set; start "
+            "the process through the lwd_source_poc launcher (no key-file "
+            "fallback is configured)"
+        )
+    key_path = config.get("key_path")
+    if key_path is None:
+        raise LwdSourceProtectionError(
+            f"no runtime key: set {KEY_ENV_VAR} or declare key_path in the "
+            "runtime configuration"
+        )
+    return load_key_file(Path(key_path))
+
+
 def install(
     config_path: str | os.PathLike[str] | None = None, *, suppress_errors: bool = False
 ) -> bool:
@@ -828,9 +928,13 @@ def install(
         )
     try:
         config = load_runtime_config(path)
-        manifest = load_manifest(Path(config["manifest_path"]))
+        manifest = (
+            load_manifest(Path(config["manifest_path"]))
+            if "manifest_path" in config
+            else config["manifest"]
+        )
         _validate_config_against_manifest(config, manifest)
-        key = load_key_file(Path(config["key_path"]))
+        key = _config_key(config)
         records = build_module_records(manifest, config["repositories"])
         errors: list[str] = []
         for record in records.values():
@@ -933,8 +1037,11 @@ def status(purelib: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     if config_path.is_file():
         try:
             config = load_runtime_config(config_path)
-            result["manifest_path"] = config["manifest_path"]
-            result["key_path"] = config["key_path"]
+            if "manifest_path" in config:
+                result["manifest_path"] = config["manifest_path"]
+            if "key_path" in config:
+                result["key_path"] = config["key_path"]
+            result["key_source"] = config.get("key_source", "file")
             result["repositories"] = dict(config["repositories"])
             result["modules"] = list(config["modules"])
         except LwdSourceProtectionError as exc:
