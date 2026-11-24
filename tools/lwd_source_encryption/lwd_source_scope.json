@@ -1,0 +1,36 @@
+{
+  "format_version": 1,
+  "description": "Auditable runtime-only LWD source scope. Scan each package root recursively; include a .py source when any directory below the package root starts with 'lwd' or its file stem starts with 'lwd'. This includes every __init__.py and non-lwd filenames inside an LWD directory. Tests, docs, tools and upstream core files are outside the package roots or do not match the rule.",
+  "directory_prefix": "lwd",
+  "file_stem_prefix": "lwd",
+  "source_suffix": ".py",
+  "payload_suffix": ".py.lwdc",
+  "expected_total": 97,
+  "repositories": {
+    "vllm": {
+      "package": "vllm",
+      "expected_modules": 60,
+      "required_paths": [
+        "vllm/config/lwd",
+        "vllm/distributed/lwd",
+        "vllm/entrypoints/openai/lwd",
+        "vllm/lwd_logger.py",
+        "vllm/model_executor/model_loader/lwd_weight_filter.py",
+        "vllm/v1/lwd_comm",
+        "vllm/v1/lwd_control"
+      ]
+    },
+    "vllm-ascend": {
+      "package": "vllm_ascend",
+      "expected_modules": 37,
+      "required_paths": [
+        "vllm_ascend/distributed/lwd_data_plane",
+        "vllm_ascend/worker/lwd_base_model",
+        "vllm_ascend/worker/lwd_cloud_model",
+        "vllm_ascend/worker/lwd_debug",
+        "vllm_ascend/worker/lwd_edge_model",
+        "vllm_ascend/worker/lwd_hash"
+      ]
+    }
+  }
+}

@@ -1,9 +1,0 @@
-"""控制面诊断层:诊断开关、spec 接受率观测、诊断旁路判定与载荷提取、
-debug 打点转发;只出判定与数据,不持执行适配器,不 import 调度/执行/
-引擎类。"""
-
-from vllm.v1.lwd_control.lwd_control_diag.lwd_control_diag import (
-    LwdControlDiag,
-)
-
-__all__ = ["LwdControlDiag"]

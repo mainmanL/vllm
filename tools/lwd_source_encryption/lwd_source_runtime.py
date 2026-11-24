@@ -15,10 +15,10 @@ and is never written back to disk.  Nothing patches ``open``, ``inspect``,
 ``linecache`` or CPython: the loader implements the standard loader protocol,
 so ``inspect.getsource`` and ``linecache`` keep working.
 
-The key comes from ``LWD_SOURCE_KEY_B64`` when the launcher provides it (the
-single-file launcher exports the raw key this way) and otherwise falls back to
-the local-development key file.  A present but invalid environment value is
-fail-closed: it never falls back to the file.
+The key comes only from ``LWD_SOURCE_KEY_B64``.  There is deliberately no
+runtime key-file fallback: the ignored local ``runtime_key.b64`` is only a
+build/ELF provisioning asset.  A missing, present-but-empty, invalid, or wrong
+key is fail-closed.
 
 This is a static-protection PoC, not a secret-keeping mechanism: the key is
 visible in the process environment (``/proc/<pid>/environ``) and
@@ -130,8 +130,8 @@ def pack_payload(
         )
     if not _MODULE_NAME_RE.fullmatch(module_name):
         raise LwdSourceProtectionError(f"invalid module name {module_name!r}")
-    if len(ciphertext) <= TAG_BYTES:
-        raise LwdSourceProtectionError("ciphertext must contain data and a GCM tag")
+    if len(ciphertext) < TAG_BYTES:
+        raise LwdSourceProtectionError("ciphertext must contain a GCM tag")
     header = _HEADER.pack(
         MAGIC, version, flags, len(name_bytes), nonce, len(ciphertext)
     )
@@ -172,7 +172,7 @@ def parse_payload(
         raise LwdSourceProtectionError(
             f"nonce must be {NONCE_BYTES} bytes, got {len(nonce)}"
         )
-    if ciphertext_len <= TAG_BYTES:
+    if ciphertext_len < TAG_BYTES:
         raise LwdSourceProtectionError(f"invalid ciphertext length {ciphertext_len}")
     if ciphertext_len > MAX_PAYLOAD_BYTES:
         raise LwdSourceProtectionError(
@@ -236,10 +236,6 @@ def encrypt_source(
     if len(nonce) != NONCE_BYTES:
         raise LwdSourceProtectionError(
             f"nonce must be {NONCE_BYTES} bytes, got {len(nonce)}"
-        )
-    if not plaintext:
-        raise LwdSourceProtectionError(
-            f"refusing to encrypt an empty source for module {module_name!r}"
         )
     name_bytes = module_name.encode("utf-8")
     if not _MODULE_NAME_RE.fullmatch(module_name):
@@ -326,8 +322,8 @@ def _require_str(value: Any, field: str) -> str:
 
 
 def _require_int(value: Any, field: str, *, minimum: int = 0) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value <= minimum:
-        raise LwdSourceProtectionError(f"{field} must be an integer > {minimum}")
+    if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
+        raise LwdSourceProtectionError(f"{field} must be an integer >= {minimum}")
     return value
 
 
@@ -386,6 +382,9 @@ def validate_manifest(
         _ = package
     modules = _require_list(data.get("modules"), f"{source}: modules")
     seen: set[str] = set()
+    seen_sources: set[tuple[str, str]] = set()
+    seen_payloads: set[tuple[str, str]] = set()
+    identities: list[tuple[str, str]] = []
     for index, entry in enumerate(modules):
         field = f"{source}: modules[{index}]"
         item = _require_mapping(entry, field)
@@ -400,13 +399,43 @@ def validate_manifest(
             )
         validate_relative_path(item.get("source"), f"{field}.source")
         validate_relative_path(item.get("payload"), f"{field}.payload")
+        source_path = _require_str(item.get("source"), f"{field}.source")
         payload = _require_str(item.get("payload"), f"{field}.payload")
-        if not payload.endswith(PAYLOAD_SUFFIX):
+        if not source_path.endswith(".py"):
+            raise LwdSourceProtectionError(f"{field}.source must end with '.py'")
+        if payload != source_path + PAYLOAD_SUFFIX:
             raise LwdSourceProtectionError(
-                f"{field}.payload must end with {PAYLOAD_SUFFIX!r}"
+                f"{field}.payload must be the source path plus {PAYLOAD_SUFFIX!r}"
             )
-        if payload == item.get("source"):
-            raise LwdSourceProtectionError(f"{field}.payload must differ from source")
+        identity = (repository, source_path)
+        payload_identity = (repository, payload)
+        if identity in seen_sources:
+            raise LwdSourceProtectionError(f"{field}: duplicate source {identity}")
+        if payload_identity in seen_payloads:
+            raise LwdSourceProtectionError(f"{field}: duplicate payload {identity}")
+        seen_sources.add(identity)
+        seen_payloads.add(payload_identity)
+        identities.append(identity)
+        package = repositories[repository]["package"]
+        source_parts = PurePosixPath(source_path).parts
+        if not source_parts or source_parts[0] != package:
+            raise LwdSourceProtectionError(
+                f"{field}.source must be below package root {package}"
+            )
+        module_parts = list(source_parts[1:])
+        module_parts[-1] = module_parts[-1][:-3]
+        if module_parts[-1] == "__init__":
+            module_parts.pop()
+        if not module_parts:
+            raise LwdSourceProtectionError(
+                f"{field}: the top-level package itself cannot be protected"
+            )
+        expected_module = ".".join((package, *module_parts))
+        if name != expected_module:
+            raise LwdSourceProtectionError(
+                f"{field}.module {name!r} does not match source path; "
+                f"expected {expected_module!r}"
+            )
         sha_value = item.get("plaintext_sha256")
         if not (allow_unbuilt and sha_value is None):
             _require_sha256(sha_value, f"{field}.plaintext_sha256")
@@ -414,9 +443,13 @@ def validate_manifest(
         if not (allow_unbuilt and size_value is None):
             _require_int(size_value, f"{field}.plaintext_bytes")
         if "payload_bytes" in item:
-            _require_int(item.get("payload_bytes"), f"{field}.payload_bytes")
+            _require_int(item.get("payload_bytes"), f"{field}.payload_bytes", minimum=1)
+        elif not allow_unbuilt:
+            raise LwdSourceProtectionError(f"{field}.payload_bytes is required")
         if "payload_sha256" in item:
             _require_sha256(item.get("payload_sha256"), f"{field}.payload_sha256")
+        elif not allow_unbuilt:
+            raise LwdSourceProtectionError(f"{field}.payload_sha256 is required")
         canaries = item.get("canary_line_sha256", [])
         if not isinstance(canaries, list):
             raise LwdSourceProtectionError(
@@ -424,6 +457,26 @@ def validate_manifest(
             )
         for canary in canaries:
             _require_sha256(canary, f"{field}.canary_line_sha256[]")
+    if "scope" in data:
+        if identities != sorted(identities):
+            raise LwdSourceProtectionError(
+                f"{source}: modules must be sorted by (repository, source)"
+            )
+        if data.get("expected_total") != len(modules):
+            raise LwdSourceProtectionError(
+                f"{source}: expected_total must equal module count {len(modules)}"
+            )
+        scope = _require_mapping(data["scope"], f"{source}: scope")
+        _require_str(scope.get("file"), f"{source}: scope.file")
+        _require_sha256(scope.get("sha256"), f"{source}: scope.sha256")
+        for name, expected in (
+            (name, item.get("expected_modules")) for name, item in repositories.items()
+        ):
+            actual = sum(entry["repository"] == name for entry in modules)
+            if expected != actual:
+                raise LwdSourceProtectionError(
+                    f"{source}: {name} expected_modules={expected}, actual={actual}"
+                )
     verification = data.get("verification", {})
     if verification:
         _validate_verification(verification, seen, f"{source}: verification")
@@ -489,12 +542,10 @@ def load_key_file(path: Path) -> bytes:
 
 
 def load_key_from_env() -> bytes | None:
-    """Decode the key the launcher exports through ``LWD_SOURCE_KEY_B64``.
+    """Decode the only runtime key source, ``LWD_SOURCE_KEY_B64``.
 
-    Returns ``None`` when the variable is unset, so callers can fall back to the
-    key-file workflow used for local development and ``build``.  A variable that
-    is present but empty, not base64, or not 32 bytes raises: silently ignoring
-    it would select another key source and hide a broken deployment.
+    Returns ``None`` only when the variable is unset.  Local key files are
+    intentionally not consulted by the runtime.
     """
     raw = os.environ.get(KEY_ENV_VAR)
     if raw is None:
@@ -518,17 +569,15 @@ def load_key_from_env() -> bytes | None:
     return key
 
 
-def load_key(key_path: Path | None = None) -> bytes:
-    """Return the runtime key: environment first, then the local key file."""
+def load_key() -> bytes:
+    """Return the runtime key exclusively from ``LWD_SOURCE_KEY_B64``."""
     key = load_key_from_env()
-    if key is not None:
-        return key
-    if key_path is not None:
-        return load_key_file(Path(key_path))
-    raise LwdSourceProtectionError(
-        f"no runtime key available: set {KEY_ENV_VAR} (the lwd_source_poc "
-        "launcher does this) or provide a key file"
-    )
+    if key is None:
+        raise LwdSourceProtectionError(
+            f"no runtime key available: set {KEY_ENV_VAR}; "
+            "runtime key-file fallback is disabled"
+        )
+    return key
 
 
 def load_runtime_config(path: Path) -> dict[str, Any]:
@@ -558,9 +607,7 @@ def load_runtime_config(path: Path) -> dict[str, Any]:
     if manifest_path is not None:
         manifest_path = _require_str(manifest_path, f"{path}: manifest_path")
         if not os.path.isabs(manifest_path):
-            raise LwdSourceProtectionError(
-                f"{path}: manifest_path must be absolute"
-            )
+            raise LwdSourceProtectionError(f"{path}: manifest_path must be absolute")
     inline_manifest = data.get("manifest")
     if inline_manifest is not None:
         validate_manifest(inline_manifest, source=f"{path}: manifest")
@@ -569,21 +616,13 @@ def load_runtime_config(path: Path) -> dict[str, Any]:
             f"{path}: must declare manifest_path or an inline manifest"
         )
 
-    key_source = data.get("key_source")
-    if key_source is not None:
-        key_source = _require_str(key_source, f"{path}: key_source")
-        if key_source not in KEY_SOURCES:
-            raise LwdSourceProtectionError(
-                f"{path}: unsupported key_source {key_source!r}"
-            )
-    key_path = data.get("key_path")
-    if key_path is not None:
-        key_path = _require_str(key_path, f"{path}: key_path")
-        if not os.path.isabs(key_path):
-            raise LwdSourceProtectionError(f"{path}: key_path must be absolute")
-    if key_source is None and key_path is None:
+    if data.get("key_source") != "env":
         raise LwdSourceProtectionError(
-            f"{path}: must declare key_source or key_path"
+            f"{path}: key_source must be 'env'; runtime key files are disabled"
+        )
+    if "key_path" in data:
+        raise LwdSourceProtectionError(
+            f"{path}: key_path is forbidden; set {KEY_ENV_VAR} instead"
         )
     repositories = _require_mapping(data.get("repositories"), f"{path}: repositories")
     for name, value in repositories.items():
@@ -664,6 +703,14 @@ class ProtectedModule:
         self.payload_bytes = payload_bytes
         self.error: LwdSourceProtectionError | None = None
 
+    @property
+    def is_package(self) -> bool:
+        return self.origin.name == "__init__.py"
+
+    @property
+    def package_root(self) -> Path | None:
+        return self.origin.parent if self.is_package else None
+
     def read_payload(self) -> bytes:
         try:
             size = self.payload_path.stat().st_size
@@ -720,6 +767,12 @@ class ProtectedModule:
                 f"plaintext size mismatch for module {self.name!r}: "
                 f"got {len(encoded)} bytes, manifest records {self.plaintext_bytes}"
             )
+        try:
+            compile(text, str(self.origin), "exec", dont_inherit=True)
+        except (SyntaxError, ValueError, TypeError) as exc:
+            raise LwdSourceProtectionError(
+                f"plaintext of module {self.name!r} does not compile: {exc}"
+            ) from exc
 
     def source(self, key: bytes) -> str:
         """Decrypt and hash-check the source text of this module."""
@@ -794,6 +847,8 @@ class LwdSourceProtectionLoader(importlib.abc.Loader):
         origin = str(self._record.origin)
         source = self.get_source(module.__name__)
         module.__file__ = origin
+        if self._record.is_package and not hasattr(module, "__path__"):
+            module.__path__ = [str(self._record.origin.parent)]
         code = compile(source, origin, "exec", dont_inherit=True)
         exec(code, module.__dict__)
 
@@ -814,14 +869,31 @@ class LwdSourceProtectionLoader(importlib.abc.Loader):
             str(self._record.origin)
         ):
             return self._record.source(self._key).encode("utf-8")
+        package_root = self._record.package_root
+        if package_root is not None:
+            root = os.path.normcase(str(package_root.resolve()))
+            candidate = os.path.normcase(os.path.realpath(path))
+            try:
+                inside = os.path.commonpath([root, candidate]) == root
+            except ValueError:
+                inside = False
+            if inside and Path(path).suffix not in (".py", ".lwdc"):
+                try:
+                    return Path(path).read_bytes()
+                except OSError as exc:
+                    raise OSError(
+                        f"cannot read package resource {path!r} for "
+                        f"{self._record.name!r}: {exc}"
+                    ) from exc
         raise OSError(
             f"{path!r} is not available: protected module "
-            f"{self._record.name!r} has no on-disk source"
+            f"{self._record.name!r} exposes only its decrypted source and "
+            "non-Python package resources"
         )
 
     def is_package(self, fullname: str) -> bool:
         self._check_name(fullname)
-        return False
+        return self._record.is_package
 
 
 class LwdSourceProtectionFinder(importlib.abc.MetaPathFinder):
@@ -841,9 +913,14 @@ class LwdSourceProtectionFinder(importlib.abc.MetaPathFinder):
                 f"protected module {fullname!r} is not servable: {record.error}"
             ) from record.error
         loader = LwdSourceProtectionLoader(record, self._key)
+        search_locations = [str(record.origin.parent)] if record.is_package else None
         spec = importlib.machinery.ModuleSpec(
-            fullname, loader, origin=str(record.origin)
+            fullname,
+            loader,
+            origin=str(record.origin),
+            is_package=record.is_package,
         )
+        spec.submodule_search_locations = search_locations
         spec.has_location = True
         return spec
 
@@ -891,22 +968,9 @@ def _unregister_finder(finder_type: type[LwdSourceProtectionFinder]) -> None:
 
 
 def _config_key(config: dict[str, Any]) -> bytes:
-    key = load_key_from_env()
-    if key is not None:
-        return key
-    if config.get("key_source") == "env":
-        raise LwdSourceProtectionError(
-            f"runtime key source is 'env' but {KEY_ENV_VAR} is not set; start "
-            "the process through the lwd_source_poc launcher (no key-file "
-            "fallback is configured)"
-        )
-    key_path = config.get("key_path")
-    if key_path is None:
-        raise LwdSourceProtectionError(
-            f"no runtime key: set {KEY_ENV_VAR} or declare key_path in the "
-            "runtime configuration"
-        )
-    return load_key_file(Path(key_path))
+    if config.get("key_source") != "env":
+        raise LwdSourceProtectionError("runtime key source must be 'env'")
+    return load_key()
 
 
 def install(
@@ -1039,9 +1103,7 @@ def status(purelib: str | os.PathLike[str] | None = None) -> dict[str, Any]:
             config = load_runtime_config(config_path)
             if "manifest_path" in config:
                 result["manifest_path"] = config["manifest_path"]
-            if "key_path" in config:
-                result["key_path"] = config["key_path"]
-            result["key_source"] = config.get("key_source", "file")
+            result["key_source"] = "env"
             result["repositories"] = dict(config["repositories"])
             result["modules"] = list(config["modules"])
         except LwdSourceProtectionError as exc:

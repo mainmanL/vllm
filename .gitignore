@@ -252,5 +252,9 @@ vllm/grpc/vllm_engine_pb2.py
 vllm/grpc/vllm_engine_pb2_grpc.py
 vllm/grpc/vllm_engine_pb2.pyi
 
+# LWD source-encryption local secrets and optional compiled launcher
+/tools/lwd_source_encryption/runtime_key.b64
+/tools/lwd_source_encryption/lwd_source_poc
+
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
