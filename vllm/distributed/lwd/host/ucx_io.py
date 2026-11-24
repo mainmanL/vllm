@@ -108,7 +108,7 @@ class LwdBaseUcxChannelIo:
         self._op = config.op
         self._device = config.device
         self._device_index = config.device.index
-        if config.op == "send" and self._device_index is None:
+        if self._device_index is None and config.device.type != "cpu":
             self._device_index = torch.accelerator.current_device_index()
         self._stream = stream
         self.tag = f"{channel.value}/{config.op}"
@@ -417,7 +417,8 @@ class LwdBaseUcxChannelIo:
         tag_str = self.tag
 
         def cb(op) -> None:  # noqa: ANN001 - LwdUcxOp (lib IO thread)
-            torch.accelerator.set_device_index(self._device_index)
+            if self._device_index is not None:
+                torch.accelerator.set_device_index(self._device_index)
             if self._tr_recv_done:
                 self._tr_recv_done = False
                 lwd_logger.info(
