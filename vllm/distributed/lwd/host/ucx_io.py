@@ -343,7 +343,7 @@ class LwdBaseUcxChannelIo:
         try:
             tag = seqno if seqno is not None else _NO_SEQNO_TAG
             t0 = time.monotonic()
-            with torch.inference_mode(), torch.stream(self._stream):
+            with torch.inference_mode(), self._stream:
                 mv = memoryview(stg.buf)
                 dst = torch.frombuffer(mv[:payload_bytes], dtype=tensor.dtype)
                 dst.copy_(tensor.reshape(dst.shape))
@@ -494,7 +494,7 @@ class LwdBaseUcxChannelIo:
         """
         copy_stream = self._copy_stream_or_create()
         copy_stream.wait_event(done_event)
-        with torch.stream(copy_stream):
+        with copy_stream:
             for dst, src_off, n in req.stage_segments:
                 dst.copy_(buffer[src_off : src_off + n], non_blocking=True)
             staged_event = torch.Event()
