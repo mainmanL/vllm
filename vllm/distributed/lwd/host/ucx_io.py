@@ -417,7 +417,7 @@ class LwdBaseUcxChannelIo:
         tag_str = self.tag
 
         def cb(op) -> None:  # noqa: ANN001 - LwdUcxOp (lib IO thread)
-            torch.accelerator.set_device_index(self._device)
+            torch.accelerator.set_device_index(self._device_index)
             if self._tr_recv_done:
                 self._tr_recv_done = False
                 lwd_logger.info(
@@ -443,7 +443,7 @@ class LwdBaseUcxChannelIo:
                     future._finalize(error=err)
                     self._ch.fail(err)
                     return
-                with torch.inference_mode(), torch.stream(stream):
+                with torch.inference_mode(), stream:
                     mv = memoryview(data)
                     buffer.copy_(
                         torch.frombuffer(mv[:payload_len], dtype=buffer.dtype),
