@@ -126,20 +126,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
         return bool(self._lwd_abort_pending) or super().has_requests()
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
-        resumed_before = {
-            request_id: (
-                request.num_computed_tokens,
-                request.num_tokens,
-                request.num_output_tokens,
-                request.num_output_placeholders,
-                request.num_stale_output_tokens,
-                request.drop_stale_output,
-                self.lwd_recv_rows.get(request_id, 0),
-                request.status.name,
-            )
-            for request_id, request in self.requests.items()
-            if request.num_preemptions > 0 and not request.is_finished()
-        }
         decode_ids = self._lwd_collect_decode_requests()
         decode_exact = self._lwd_compute_decode_consumption(decode_ids)
         room = self.max_num_scheduled_tokens - decode_exact
@@ -148,25 +134,27 @@ class LwdCloudScheduler(LwdBaseScheduler):
             out = self._lwd_dispatch_windows(windows, decode_ids, decode_exact)
         else:
             out = self._lwd_schedule(decode_ids)
+        preempted_req_ids = sorted(out.preempted_req_ids or ())
+        if preempted_req_ids:
+            lwd_logger.info(
+                "[LWD][preempt] dp=%d step=%d req_ids=%s",
+                self.parallel_config.data_parallel_rank,
+                self.current_step,
+                preempted_req_ids,
+            )
+        resumed_req_ids = sorted(out.scheduled_cached_reqs.resumed_req_ids)
+        if resumed_req_ids:
+            lwd_logger.info(
+                "[LWD][resume] dp=%d step=%d req_ids=%s",
+                self.parallel_config.data_parallel_rank,
+                self.current_step,
+                resumed_req_ids,
+            )
         if windows:
             self._lwd_verify_w2(out, windows, decode_exact)
             self._lwd_warn_under_scheduled(out, windows)
         self._lwd_attach_request_metadata(out)
         self._lwd_attach_abort_notice(out)
-        if resumed_before:
-            lwd_logger.info(
-                "[LWD][resume-sched] dp=%d step=%d before=%s scheduled=%s "
-                "resumed=%s windows=%s",
-                self.parallel_config.data_parallel_rank,
-                self.current_step,
-                resumed_before,
-                out.num_scheduled_tokens,
-                sorted(out.scheduled_cached_reqs.resumed_req_ids),
-                [
-                    (window.request.request_id, window.start, window.num_rows)
-                    for window in windows
-                ],
-            )
         return out
 
     def _lwd_collect_decode_requests(self) -> list[str]:
