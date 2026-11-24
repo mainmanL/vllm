@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 """LWD UCX data-plane accelerator assembly layer.
 
@@ -104,6 +107,9 @@ class LwdBaseUcxChannelIo:
         self._channel = channel
         self._op = config.op
         self._device = config.device
+        self._device_index = config.device.index
+        if config.op == "send" and self._device_index is None:
+            self._device_index = torch.accelerator.current_device_index()
         self._stream = stream
         self.tag = f"{channel.value}/{config.op}"
         self._stopped = False
@@ -299,7 +305,8 @@ class LwdBaseUcxChannelIo:
     # Send: pool block (acquire_staging) -> direct D2H -> ch.send        #
     # ------------------------------------------------------------------ #
     def _sender_loop(self) -> None:
-        torch.accelerator.set_device_index(self._device)
+        assert self._device_index is not None
+        torch.accelerator.set_device_index(self._device_index)
         while True:
             task = self._sq.get()
             if task is None:
