@@ -73,6 +73,37 @@ def test_unembed_waits_for_receive_completion_before_lm_head() -> None:
     assert output.sampled_token_ids == [[1, 1]]
 
 
+@pytest.mark.parametrize("load_dummy_weights", [False, True])
+def test_load_model_matches_native_dummy_weights_contract(
+    load_dummy_weights: bool,
+) -> None:
+    runner = object.__new__(LwdEdgeGPUModelRunner)
+    runner.load_config = SimpleNamespace(load_format="auto")
+    runner.vllm_config = SimpleNamespace()
+    runner.model_config = SimpleNamespace()
+    model = SimpleNamespace()
+    layout = object()
+
+    with (
+        patch(
+            "vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner.LwdEdgeModelLoader"
+        ) as loader_cls,
+        patch.object(runner, "_lwd_load_tid2eid_tables"),
+        patch.object(runner, "_lwd_build_up_payload_layout", return_value=layout),
+    ):
+        loader_cls.return_value.load_model.return_value = model
+        runner.load_model(load_dummy_weights=load_dummy_weights)
+
+    assert runner.model is model
+    assert runner.up_payload_layout is layout
+    assert runner.load_config.load_format == ("dummy" if load_dummy_weights else "auto")
+    loader_cls.assert_called_once_with(runner.load_config, runner.vllm_config)
+    loader_cls.return_value.load_model.assert_called_once_with(
+        vllm_config=runner.vllm_config,
+        model_config=runner.model_config,
+    )
+
+
 def test_gpu_worker_uses_host_ucx_without_native_warmup() -> None:
     worker = object.__new__(LwdEdgeWorker)
     worker.vllm_config = SimpleNamespace(

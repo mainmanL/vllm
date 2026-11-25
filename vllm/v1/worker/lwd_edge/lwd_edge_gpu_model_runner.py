@@ -82,9 +82,11 @@ class LwdEdgeGPUModelRunner(LwdBaseGPUModelRunner):
         # reads the positions before the chunk.
         self._lwd_engram_prompts: dict[str, torch.Tensor] = {}
 
-    def load_model(self) -> None:
+    def load_model(self, load_dummy_weights: bool = False) -> None:
         """Load the edge model, read the CPU Hash routing tables for
         DeepSeek V4 from the weight files, and fix the UP payload layout."""
+        if load_dummy_weights:
+            self.load_config.load_format = "dummy"
         loader = LwdEdgeModelLoader(self.load_config, self.vllm_config)
         self.model = loader.load_model(
             vllm_config=self.vllm_config,
