@@ -6,7 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_control_diag import (
+    LwdCloudAdmissionMeter,
+    LwdControlDiag,
+    LwdEdgeDispatchMeter,
+)
 
 
 def test_switches_strict_one_and_live_read(monkeypatch):
@@ -99,3 +103,63 @@ def test_bypass_unembed_rows_gating(monkeypatch):
         batch_meta=SimpleNamespace(req_ids=["a"], token_ids=[]),
     )
     assert LwdControlDiag.bypass_unembed_rows(empty) is None
+
+
+def test_edge_dispatch_meter_reports_gate_reasons_and_snapshot(caplog):
+    meter = LwdEdgeDispatchMeter()
+    meter.note_gate(
+        "edge0-cloud0-dp0",
+        pending=10,
+        max_pending=10,
+        running=8,
+        max_running=8,
+        resume=False,
+        cap=0,
+        free_seq=0,
+        decode_debt=8192,
+    )
+    meter.note_pick("edge0-cloud0-dp0", 0)
+
+    with caplog.at_level("INFO", logger="vllm.lwd_meter"):
+        meter._report()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert (
+        "[lwd][edge-gate] 1 gate checks: seat=1 pending=1 cap0=1 free_seq0=1; "
+        "picks=1 empty=1"
+    ) in messages
+    assert (
+        "[lwd][edge-gate-detail] edge0-cloud0-dp0 pending=10/10 running=8/8 "
+        "resume=False cap=0 free_seq=0 decode_debt=8192 picked=0"
+    ) in messages
+
+
+def test_cloud_admission_meter_reports_latest_running_and_waiting(caplog):
+    meter = LwdCloudAdmissionMeter()
+    meter.note_step(
+        room=100,
+        admitted=64,
+        num_windows=1,
+        blocked=(0, 0),
+        queue_depth=3,
+        reserved=0,
+        running=7,
+        waiting=3,
+    )
+    meter.note_step(
+        room=100,
+        admitted=0,
+        num_windows=0,
+        blocked=(0, 0),
+        queue_depth=1,
+        reserved=0,
+        running=9,
+        waiting=1,
+    )
+
+    with caplog.at_level("INFO", logger="vllm.lwd_meter"):
+        meter._report()
+
+    message = caplog.records[-1].getMessage()
+    assert "avg queue=2.0" in message
+    assert "running=9 waiting=1" in message

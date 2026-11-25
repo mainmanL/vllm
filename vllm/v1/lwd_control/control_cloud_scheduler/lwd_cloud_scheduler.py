@@ -153,6 +153,8 @@ class LwdCloudScheduler(LwdBaseScheduler):
             blocked=(0, 0),
             queue_depth=len(self.waiting),
             reserved=0,
+            running=len(self.running),
+            waiting=len(self.waiting),
         )
 
     def _lwd_collect_decode_requests(self) -> list[str]:

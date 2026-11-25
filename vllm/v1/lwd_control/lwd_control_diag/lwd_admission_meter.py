@@ -58,6 +58,8 @@ class LwdCloudAdmissionMeter(LwdIntervalMeter):
         self._blocked_no_arrival = 0
         self._queue_depth = 0
         self._reserved = 0
+        self._running = 0
+        self._waiting = 0
 
     def note_step(
         self,
@@ -67,6 +69,8 @@ class LwdCloudAdmissionMeter(LwdIntervalMeter):
         blocked: tuple[int, int],
         queue_depth: int,
         reserved: int,
+        running: int,
+        waiting: int,
     ) -> None:
         """Record one scheduling step's prefill admission.
 
@@ -84,6 +88,8 @@ class LwdCloudAdmissionMeter(LwdIntervalMeter):
         self._blocked_no_arrival += blocked[1]
         self._queue_depth += queue_depth
         self._reserved += reserved
+        self._running = running
+        self._waiting = waiting
         if room > 0:
             self._steps_with_room += 1
         if admitted:
@@ -99,7 +105,7 @@ class LwdCloudAdmissionMeter(LwdIntervalMeter):
             "room=%d admitted=%d (%.1f%% of room) windows=%d; "
             "steps with room=%d admitting=%d; "
             "blocked partial=%d no_arrival=%d; "
-            "avg queue=%.1f reserved=%.0f tok/step",
+            "avg queue=%.1f reserved=%.0f tok/step; running=%d waiting=%d",
             steps,
             self._room,
             self._admitted,
@@ -111,4 +117,6 @@ class LwdCloudAdmissionMeter(LwdIntervalMeter):
             self._blocked_no_arrival,
             self._queue_depth / steps,
             self._reserved / steps,
+            self._running,
+            self._waiting,
         )

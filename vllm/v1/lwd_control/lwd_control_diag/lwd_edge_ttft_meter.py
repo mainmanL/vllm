@@ -336,3 +336,108 @@ class LwdEdgeIntakeMeter(LwdIntervalMeter):
             self._idle,
             self._gap,
         )
+
+
+@dataclass(slots=True)
+class _LwdGateSnapshot:
+    pending: int
+    max_pending: int
+    running: int
+    max_running: int
+    resume: bool
+    cap: int
+    free_seq: int
+    decode_debt: int
+    picked: int = -1
+
+
+class LwdEdgeDispatchMeter(LwdIntervalMeter):
+    """Why the edge cannot turn routed prefills into EMBED batches.
+
+    Gate checks and picker calls are counted separately: an all-gated step
+    never reaches the picker. The latest per-connection snapshot makes the
+    two budgets visible even when no HOLD transition is logged.
+    """
+
+    def _reset(self) -> None:
+        self._checks = 0
+        self._seat_gated = 0
+        self._pending_gated = 0
+        self._cap_zero = 0
+        self._free_seq_zero = 0
+        self._picks = 0
+        self._empty_picks = 0
+        self._snapshots: dict[str, _LwdGateSnapshot] = {}
+
+    def note_gate(
+        self,
+        connection_id: str,
+        *,
+        pending: int,
+        max_pending: int,
+        running: int,
+        max_running: int,
+        resume: bool,
+        cap: int,
+        free_seq: int,
+        decode_debt: int,
+    ) -> None:
+        self._checks += 1
+        if not resume:
+            if running >= max_running:
+                self._seat_gated += 1
+            if pending >= max_pending:
+                self._pending_gated += 1
+        if cap <= 0:
+            self._cap_zero += 1
+        if free_seq <= 0:
+            self._free_seq_zero += 1
+        self._snapshots[connection_id] = _LwdGateSnapshot(
+            pending,
+            max_pending,
+            running,
+            max_running,
+            resume,
+            cap,
+            free_seq,
+            decode_debt,
+        )
+
+    def note_pick(self, connection_id: str, picked: int) -> None:
+        self._picks += 1
+        if picked == 0:
+            self._empty_picks += 1
+        self._snapshots[connection_id].picked = picked
+
+    def tick(self) -> None:
+        self._roll()
+
+    def _report(self) -> None:
+        if not self._checks and not self._picks:
+            return
+        logger.info(
+            "[lwd][edge-gate] %d gate checks: seat=%d pending=%d cap0=%d "
+            "free_seq0=%d; picks=%d empty=%d",
+            self._checks,
+            self._seat_gated,
+            self._pending_gated,
+            self._cap_zero,
+            self._free_seq_zero,
+            self._picks,
+            self._empty_picks,
+        )
+        for connection_id, snapshot in sorted(self._snapshots.items()):
+            logger.info(
+                "[lwd][edge-gate-detail] %s pending=%d/%d running=%d/%d "
+                "resume=%s cap=%d free_seq=%d decode_debt=%d picked=%d",
+                connection_id,
+                snapshot.pending,
+                snapshot.max_pending,
+                snapshot.running,
+                snapshot.max_running,
+                snapshot.resume,
+                snapshot.cap,
+                snapshot.free_seq,
+                snapshot.decode_debt,
+                snapshot.picked,
+            )

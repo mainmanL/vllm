@@ -68,6 +68,7 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
 )
 from vllm.v1.lwd_control.lwd_control_diag import (
     LwdControlDiag,
+    LwdEdgeDispatchMeter,
     LwdEdgeIntakeMeter,
     LwdEdgeSendMeter,
     LwdEdgeTtftMeter,
@@ -140,6 +141,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self.lwd_ttft_meter = LwdEdgeTtftMeter()
         """Hop stamps of the edge's share of TTFT, from the client's arrival
         stamp to the first prompt rows leaving."""
+        self.lwd_dispatch_meter = LwdEdgeDispatchMeter()
+        """Why routed prefills cannot be dispatched, by connection."""
         self.lwd_intake_meter = LwdEdgeIntakeMeter()
         """What the engine thread spends taking requests in before it steps."""
         self.lwd_send_meter = LwdEdgeSendMeter()
@@ -398,7 +401,20 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         for connection_id, account in self._lwd_accounts.items():
             if self._lwd_has_prefill_work(connection_id):
                 self._lwd_log_gate_transition(account)
+                cap, free_seq, decode_debt = self._lwd_prefill_budget(connection_id)
+                self.lwd_dispatch_meter.note_gate(
+                    str(connection_id),
+                    pending=account.pending_chunks(),
+                    max_pending=account.max_pending_chunks,
+                    running=self._lwd_running_on(connection_id),
+                    max_running=self.max_num_running_reqs,
+                    resume=self._lwd_has_prefill_chunk_inflight(connection_id),
+                    cap=cap,
+                    free_seq=free_seq,
+                    decode_debt=decode_debt,
+                )
         if servable is None:
+            self.lwd_dispatch_meter.tick()
             return None
         self._lwd_last_engine, connection_id = servable
         return connection_id
@@ -653,14 +669,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         structured = request.structured_output_request
         return bool(structured and structured.grammar)
 
-    def _lwd_pick_prefill_batch(
-        self, dp_idx: LwdConnectionId
-    ) -> tuple[list[str], dict[str, int], int]:
-        """Pick routed candidates within decode debt and native edge slots."""
-        # Runs on every step and returns from several places; the meter's
-        # interval is rolled here so a window that dispatches nothing -- the
-        # one worth reading -- still reports.
-        self.lwd_ttft_meter.tick()
+    def _lwd_prefill_budget(self, dp_idx: LwdConnectionId) -> tuple[int, int, int]:
         account = self._lwd_accounts[dp_idx]
         # Decode debt on demand: native DECODE-phase requests routed to
         # this engine reserve spec-token budget once embedding completes
@@ -674,6 +683,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         # Native edge slots are shared across DP routes. Waiting requests
         # must not reserve slots before admission.
         free_seq = self.max_num_running_reqs - len(self.running)
+        return cap, free_seq, decode_debt
+
+    def _lwd_pick_prefill_batch(
+        self, dp_idx: LwdConnectionId
+    ) -> tuple[list[str], dict[str, int], int]:
+        """Pick routed candidates within decode debt and native edge slots."""
+        # Runs on every step and returns from several places; the meter's
+        # interval is rolled here so a window that dispatches nothing -- the
+        # one worth reading -- still reports.
+        self.lwd_ttft_meter.tick()
+        account = self._lwd_accounts[dp_idx]
+        cap, free_seq, _ = self._lwd_prefill_budget(dp_idx)
         # Resume candidates take only the prefill phase (decode-phase
         # residents have remaining=0, which the picker would skip anyway;
         # after the filter, a non-empty candidate list is itself the resume
@@ -708,6 +729,8 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 else self._lwd_chunk_unit
             ),
         )
+        self.lwd_dispatch_meter.note_pick(str(dp_idx), len(req_ids))
+        self.lwd_dispatch_meter.tick()
         return req_ids, expected, cap
 
     def _lwd_schedule_batch(self, dp_idx: LwdConnectionId) -> SchedulerOutput:
