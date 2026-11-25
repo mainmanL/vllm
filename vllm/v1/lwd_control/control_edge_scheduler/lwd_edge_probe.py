@@ -101,7 +101,8 @@ class LwdEdgeProbeManager:
             url = cloud.coord_url or f"http://{cloud.addr}:{cloud.coord_port}"
             self._targets[connection_id] = url.rstrip("/")
         self._health = LwdCloudHealthTracker(
-            tuple((target.cloud_id, target.dp_idx) for target in self._targets)
+            tuple((target.cloud_id, target.dp_idx) for target in self._targets),
+            edge_id=vllm_config.lwd_config.instance_id,
         )
 
     @property

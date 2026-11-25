@@ -125,7 +125,8 @@ def c_accept(srv_fd: int) -> tuple[int, str]:
 
 
 def c_set_tos(fd: int, tos: int) -> None:
-    """IP_TOS (same DSCP as RDMA data frames: tos = traffic_class << 2).
+    """IP_TOS byte, the same RoCE traffic class the RDMA data frames carry
+    (DSCP << 2 | ECN, i.e. the configured value as is).
     The server sets it before bind so accepted connections inherit it (Linux
     inherits the listening socket's TOS); the client sets it before connect.
     Failure is not fatal (warn only when the kernel/platform does not

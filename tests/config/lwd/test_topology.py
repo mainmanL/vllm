@@ -259,6 +259,54 @@ def test_host_layout_accepts_rank_free_topologies(name: str) -> None:
         assert all(dp.data_port is None for dp in edge.dp)
 
 
+def test_host_comm_fills_the_default_qos() -> None:
+    """Host comm ships one RoCE policy: no qos block means 138/4 + CS6."""
+    topology = LwdTopology.from_dict(host_payload())
+
+    assert topology.qos is not None
+    assert topology.qos.data_plane.traffic_class == 138
+    assert topology.qos.data_plane.sl == 4
+    assert topology.qos.ctrl_plane.dscp == 48
+
+
+def test_device_comm_leaves_qos_unset() -> None:
+    """Device (HCCL) comm keeps the historical behaviour: nothing marked."""
+    topology = LwdTopology.from_dict(topology_payload("s2_edge_share_2dp.yaml"))
+
+    assert topology.qos is None
+
+
+def test_host_comm_keeps_a_configured_plane_and_fills_the_other() -> None:
+    raw = host_payload()
+    raw["qos"] = {"data_plane": {"traffic_class": 106, "sl": 5}}
+
+    topology = LwdTopology.from_dict(raw)
+
+    assert topology.qos.data_plane.traffic_class == 106
+    assert topology.qos.data_plane.sl == 5
+    assert topology.qos.ctrl_plane.dscp == 48  # the omitted plane is filled
+
+
+def test_host_comm_keeps_explicit_nulls_inside_a_configured_plane() -> None:
+    """A written plane belongs to the operator, null fields included."""
+    raw = host_payload()
+    raw["qos"] = {"data_plane": {"traffic_class": 106}}
+
+    topology = LwdTopology.from_dict(raw)
+
+    assert topology.qos.data_plane.sl is None
+
+
+def test_device_comm_keeps_a_configured_qos() -> None:
+    raw = topology_payload("s2_edge_share_2dp.yaml")
+    raw["qos"] = {"data_plane": {"traffic_class": 138, "sl": 4}}
+
+    topology = LwdTopology.from_dict(raw)
+
+    assert topology.qos.data_plane.traffic_class == 138
+    assert topology.qos.ctrl_plane is None
+
+
 @pytest.mark.parametrize(
     "fault,match",
     [

@@ -165,6 +165,27 @@ def test_submit_fans_out_only_for_prefix_and_activates_winner(
         manager.close()
 
 
+def _multi_cloud_config(edge_id: int) -> SimpleNamespace:
+    config = _config(False)
+    config.lwd_config.connections = [
+        _connection(edge_id, cloud_id, dp_idx)
+        for cloud_id in (0, 1)
+        for dp_idx in (0, 1)
+    ]
+    config.lwd_config.instance_id = edge_id
+    return config
+
+
+def test_placement_staggers_cloud_and_dp_by_edge_id() -> None:
+    for edge_id in range(4):
+        manager = LwdEdgeProbeManager(_multi_cloud_config(edge_id), lambda: None)
+        try:
+            selected = manager._selected_targets(_request(), edge_id)
+            assert selected == (LwdConnectionId(edge_id, edge_id % 2, edge_id // 2),)
+        finally:
+            manager.close()
+
+
 def test_activate_style_submit_timeout_covers_semaphore_queue() -> None:
     runtime = LwdProbeRuntime(max_inflight=1)
     started = threading.Event()

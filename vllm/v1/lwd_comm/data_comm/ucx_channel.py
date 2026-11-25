@@ -647,7 +647,7 @@ class LwdUcxChannel:
         ch._srv_fd = _sock.c_open()
         if ch._cfg_traffic_class is not None:
             # set before bind: accepted connections inherit the listener TOS
-            _sock.c_set_tos(ch._srv_fd, ch._cfg_traffic_class << 2)
+            _sock.c_set_tos(ch._srv_fd, ch._cfg_traffic_class)
         _sock.c_setsockopt_int(
             ch._srv_fd,
             _sock._SOL_SOCKET,
@@ -1029,7 +1029,7 @@ class LwdUcxChannel:
             fd = _sock.c_open()
             try:
                 if self._cfg_traffic_class is not None:
-                    _sock.c_set_tos(fd, self._cfg_traffic_class << 2)
+                    _sock.c_set_tos(fd, self._cfg_traffic_class)
                 _sock.c_connect_timeout(fd, host, port, self._hs_timeout_s)
                 _sock.c_set_sock_timeouts(fd, self._hs_timeout_s)
                 _hs_send(
@@ -1710,7 +1710,7 @@ class LwdUcxListener:
         fd = self._fd
         if fd is None:
             return
-        _sock.c_set_tos(fd, int(traffic_class) << 2)
+        _sock.c_set_tos(fd, int(traffic_class))
 
     def register(self, token: int, channel: LwdUcxChannel, *, name: str = "") -> None:
         self.set_traffic_class(channel._cfg_traffic_class)

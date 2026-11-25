@@ -94,6 +94,8 @@ class _Session:
             token=int(req["token"]),
             early_max=int(req.get("early_max", 0)),
             pool_staging=bool(req.get("pool_staging", False)),
+            traffic_class=req.get("traffic_class"),
+            sl=req.get("sl"),
         )
         self._block_bytes = max(1, int(cfg.block_mb)) << 20
         # Send direction: engine D2H lands in staging blocks. Recv direction:

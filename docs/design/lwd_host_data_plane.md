@@ -35,8 +35,8 @@ clouds:
     dp:
       - {dp_idx: 0, addr: 10.1.0.1, ctrl_port: 5560, data_port: 5700}
 qos:
-  data_plane: {traffic_class: 106, sl: 5}   # optional
-  ctrl_plane: {dscp: 26}                    # optional
+  data_plane: {traffic_class: 106, sl: 5}   # optional; defaults to 138 / 4
+  ctrl_plane: {dscp: 26}                    # optional; defaults to 48
 ```
 
 | Field | Meaning |
@@ -119,11 +119,13 @@ QoS is configuration, not environment:
 
 | Plane | Field | Applied as |
 | --- | --- | --- |
-| Data | `qos.data_plane.traffic_class` | `IB_TRAFFIC_CLASS` in the UCT config of the link, plus `IP_TOS = traffic_class << 2` on the TCP handshake sockets |
+| Data | `qos.data_plane.traffic_class` | `IB_TRAFFIC_CLASS` in the UCT config of the link, plus the same byte as `IP_TOS` on the TCP handshake sockets (the field is the 8-bit RoCE traffic class, `DSCP << 2 \| ECN`) |
 | Data | `qos.data_plane.sl` | `IB_SL` in the same UCT config |
 | Control | `qos.ctrl_plane.dscp` | ZMQ `TOS = dscp << 2` on every control socket |
 
 Both peers must carry the same values; effective QoS needs matching switch PFC/ETS policy.
+
+Host comm ships one QoS policy: `LwdTopology` fills every plane the topology omits when `data_plane_comm: host`, so `data_plane` becomes `traffic_class: 138` (DSCP 34 + ECN 2) / `sl: 4` and `ctrl_plane` becomes `dscp: 48` (CS6). A plane written in the topology is kept as is, `null` fields included: the operator owns it then. Device (HCCL) comm is unchanged — LWD marks nothing there, and the HCCL data plane keeps CANN's own `HCCL_RDMA_TC` / `HCCL_RDMA_SL` unless those are set explicitly. Startup logs the effective policy once per process as `[LWD][qos] comm=host data_plane traffic_class=138 (dscp=34 ecn=2) sl=4 | ctrl_plane dscp=48 (tos=192)`, and the full record stays in the `[LWD][config] resolved=...` snapshot.
 
 ## Failure model
 

@@ -133,13 +133,15 @@ class LwdQosDataPlane:
     init, code-level, no env; device comm ignores these)."""
 
     traffic_class: Annotated[int, Field(strict=True, ge=0, le=255)] | None = None
-    """RoCEv2 DSCP / IB Traffic Class; None = UCX default (auto -> 106
-    for RoCEv2). Effective QoS needs matching switch PFC/ETS policy,
+    """IB traffic-class byte, i.e. RoCEv2 ``DSCP << 2 | ECN`` (138 is DSCP
+    34 + ECN 2). None = UCX default (auto -> 106 for RoCEv2). Host comm
+    defaults it to 138. Effective QoS needs matching switch PFC/ETS policy,
     usually paired with ``sl``; identical on both peers."""
 
     sl: Annotated[int, Field(strict=True, ge=0, le=15)] | None = None
     """RoCEv2 Ethernet priority (PCP) / IB Service Level; None = UCX
-    default (0). Pair with ``traffic_class``; identical on both peers."""
+    default (0). Host comm defaults it to 4. Pair with ``traffic_class``;
+    identical on both peers."""
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -147,16 +149,48 @@ class LwdQosCtrlPlane:
     """QoS of the LWD control plane (ZMQ links, DSCP-marked sockets)."""
 
     dscp: Annotated[int, Field(strict=True, ge=0, le=63)] | None = None
-    """DSCP mark for control-plane traffic; None = leave sockets
-    unmarked (OS default). Identical on both peers."""
+    """DSCP mark for control-plane traffic (48 = CS6); None = leave
+    sockets unmarked (OS default). Host comm defaults it to 48. Identical
+    on both peers."""
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
 class LwdQoS:
-    """Cross-plane QoS policy of the deployment (top-level ``qos`` block)."""
+    """Cross-plane QoS policy of the deployment (top-level ``qos`` block).
+
+    With ``data_plane_comm: host`` the planes this block omits fall back to
+    the host policy below; device (HCCL) comm keeps them unset.
+    """
 
     data_plane: LwdQosDataPlane | None = None
     ctrl_plane: LwdQosCtrlPlane | None = None
+
+
+# QoS defaults of the host (RoCE) data plane, applied when the topology omits
+# ``qos`` or one of its planes: RoCE QoS is a contract with the switch
+# (PFC/ETS steer on DSCP + PCP), so the host plane ships one policy instead of
+# leaving each deployment to invent its own. Device (HCCL) comm keeps the
+# historical behaviour, where nothing is marked.
+_HOST_QOS_TRAFFIC_CLASS = 138  # IB TC byte: DSCP 34 (AF41) << 2 | ECN 2
+_HOST_QOS_SL = 4  # RoCEv2 PCP / IB SL
+_HOST_QOS_CTRL_DSCP = 48  # CS6
+
+
+def _host_qos_defaults(qos: LwdQoS | None) -> LwdQoS:
+    """Fill every qos plane the host topology left out.
+
+    A plane that is present is kept as written: the operator owns it then,
+    so a None field inside it still means "leave it to UCX/the OS".
+    """
+    data_plane = qos.data_plane if qos is not None else None
+    ctrl_plane = qos.ctrl_plane if qos is not None else None
+    if data_plane is None:
+        data_plane = LwdQosDataPlane(
+            traffic_class=_HOST_QOS_TRAFFIC_CLASS, sl=_HOST_QOS_SL
+        )
+    if ctrl_plane is None:
+        ctrl_plane = LwdQosCtrlPlane(dscp=_HOST_QOS_CTRL_DSCP)
+    return LwdQoS(data_plane=data_plane, ctrl_plane=ctrl_plane)
 
 
 @dataclass(frozen=True, config=ConfigDict(extra="forbid"))
@@ -360,6 +394,17 @@ class LwdTopology:
         if [instance.id for instance in instances] != list(range(len(instances))):
             raise ValueError("[LWD] Instance IDs must be unique and contiguous from 0")
         return instances
+
+    @model_validator(mode="after")
+    def fill_host_qos(self) -> "LwdTopology":
+        """Host comm ships one RoCE QoS policy: fill the planes it left out.
+
+        Runs during validation, so every construction path gets the defaults
+        and the digest snapshots the effective policy.
+        """
+        if self.is_host_comm:
+            object.__setattr__(self, "qos", _host_qos_defaults(self.qos))
+        return self
 
     def validate_layout(self) -> None:
         """Validate instance links and placement without initializing communication."""

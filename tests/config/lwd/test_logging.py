@@ -120,3 +120,67 @@ def test_log_includes_multi_instance_api_endpoint(
         0,
         1,
     ]
+
+
+def _host_topology_file(directory: Path) -> Path:
+    """Write a host-comm layout: no ranks, no hccl_world_size, data_port per DP."""
+    raw = topology_payload("s2_edge_share_2dp.yaml")
+    deployment = raw["deployment"]
+    deployment["data_plane_comm"] = "host"
+    deployment["data_plane_host"] = {"up_buffer_size": 64, "down_buffer_size": 32}
+    deployment.pop("hccl_world_size", None)
+    for instance in raw["edges"] + raw["clouds"]:
+        for dp in instance["dp"]:
+            dp.pop("ranks", None)
+    port = 7000
+    for cloud in raw["clouds"]:
+        for dp in cloud["dp"]:
+            dp["data_port"] = port
+            port += 1
+    path = directory / "host_topology.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return path
+
+
+def _qos_line(caplog: pytest.LogCaptureFixture, config: LwdConfig) -> str:
+    with caplog.at_level(logging.INFO):
+        log_lwd_config(logging.getLogger("test.lwd-qos"), config)
+    return next(
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("[LWD][qos]")
+    )
+
+
+def test_log_shows_the_effective_host_qos(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No qos block: the host default policy is what the run actually carries."""
+    path = _host_topology_file(tmp_path)
+    config = LwdConfig.from_dict({"path": str(path), "role": "edge", "instance_id": 1})
+
+    line = _qos_line(caplog, config)
+
+    assert line == (
+        "[LWD][qos] comm=host data_plane traffic_class=138 (dscp=34 ecn=2) "
+        "sl=4 | ctrl_plane dscp=48 (tos=192)"
+    )
+
+
+def test_log_shows_device_comm_as_unmarked(
+    lwd_yaml_dir: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Device (HCCL) comm keeps the historical behaviour: nothing is marked."""
+    config = LwdConfig.from_dict(
+        {
+            "path": str(lwd_yaml_dir / "s2_edge_share_2dp.yaml"),
+            "role": "edge",
+            "instance_id": 1,
+        }
+    )
+
+    line = _qos_line(caplog, config)
+
+    assert line == (
+        "[LWD][qos] comm=device unset (lwd marks nothing; HCCL keeps its own TC/SL)"
+    )

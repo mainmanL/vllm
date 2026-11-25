@@ -9,11 +9,31 @@ import time
 LwdCloudDpId = tuple[int, int]
 
 
+def lwd_rotate_targets(
+    targets: tuple[LwdCloudDpId, ...], edge_id: int
+) -> tuple[LwdCloudDpId, ...]:
+    """Rotate DP targets so the edge's staggered first target leads.
+
+    Edges are staggered over the cloud x DP cross product: the cloud rank
+    advances first (``edge_id % cloud_count``), then the DP rank inside that
+    cloud (``edge_id // cloud_count`` modulo the cloud's DP count).
+    """
+    ordered = sorted(set(targets))
+    if not ordered:
+        return ()
+    clouds = sorted({cloud_id for cloud_id, _dp_idx in ordered})
+    first_cloud = clouds[edge_id % len(clouds)]
+    cloud_dps = [dp_idx for cloud_id, dp_idx in ordered if cloud_id == first_cloud]
+    first_dp = cloud_dps[(edge_id // len(clouds)) % len(cloud_dps)]
+    start = ordered.index((first_cloud, first_dp))
+    return tuple(ordered[start:] + ordered[:start])
+
+
 class LwdCloudHealthTracker:
     """Track DP health without changing existing request bindings."""
 
-    def __init__(self, targets: tuple[LwdCloudDpId, ...]) -> None:
-        self._targets = tuple(sorted(set(targets)))
+    def __init__(self, targets: tuple[LwdCloudDpId, ...], edge_id: int = 0) -> None:
+        self._targets = lwd_rotate_targets(targets, edge_id)
         self._failures = dict.fromkeys(self._targets, 0)
         self._cooldown_until: dict[LwdCloudDpId, float] = {}
         self._cursor = 0

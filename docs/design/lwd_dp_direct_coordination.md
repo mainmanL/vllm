@@ -501,7 +501,7 @@ next() -> LwdCloudDpTarget | None
 
 - 失败阈值和冷却默认值先沿用当前实现。
 - prefix 批次对每个候选分别记账，不能用赢家成功清除其他失败 DP 的状态。
-- placement 模式直接从健康候选中有序轮询一个 DP。
+- placement 模式直接从健康候选中有序轮询一个 DP；首个 DP 按 `edge_id` 在云和 DP 两个维度错开：云 = `edge_id % cloud_count`（云按 id 升序排名），云内 DP 位置 = `(edge_id // cloud_count) % dp_count`，之后按序轮询。
 - 全冷却时 fail-open，但不改变已绑定请求。
 
 ### 8.3 Engine 与 Scheduler
@@ -666,7 +666,7 @@ prefix probe HTTP 请求数从当前“选中一云后的 D 次内部命令”�
 - prefix 请求确实并发覆盖全部合格候选，无提前返回。
 - 已知高命中在 dp1、低命中在 dp0 时必须选择 dp1；跨云同理。
 - 不同 alignment/block size 下比较归一化命中，赢家 chain 正确重建。
-- 命中相同时按共享负载评分，再平手轮询。
+- 命中相同时按共享负载评分，再平手从 `edge_id` 错开的云/DP 开始轮询（云 = `edge_id % cloud_count`，云内 DP = `(edge_id // cloud_count) % dp_count`）。
 - 部分失败仍选成功候选中的最优；全部失败进入可观测的全量 prefill。
 - abort、重提、timeout、close 取消全部 task，迟到结果不 admission。
 - placement 只选一个 DP；显式 skip prefix 的请求不触发全候选 probe。
