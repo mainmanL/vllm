@@ -420,6 +420,10 @@ def test_coord_url_is_derived_and_available_on_every_connection() -> None:
 
 def test_probe_poll_budget_yaml_config() -> None:
     raw = topology_payload("s1_single_instance_1dp.yaml")
+    raw["clouds"][0]["coordination"] = {
+        "enabled": True,
+        "listen_host": "0.0.0.0",
+    }
     coordination = raw["clouds"][0]["coordination"]
     assert LwdTopology.from_dict(raw).clouds[0].coordination.probe_poll_budget == 32
     coordination["probe_poll_budget"] = 2

@@ -79,6 +79,7 @@ def test_log_contains_complete_selected_config_without_reading_key_contents(
         "instance_id",
         "connect_timeout",
         "probe_timeout",
+        "probe_poll_budget",
         "enforce_mm_abi_match",
     }
     assert parsed["instance_id"] == "cloud-0"

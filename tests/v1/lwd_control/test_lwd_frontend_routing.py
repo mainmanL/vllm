@@ -11,9 +11,8 @@ Covers the behavioral seams of the frontend-attach plan:
   the only scene that accepts attach metadata; ``client_index`` stays a
   frontend grouping key (the attach frontend's non-primary edge instance
   id), never a topology identity;
-* B - the edge scheduler's ``_lwd_req_id_to_client`` pin table and the
-  per-client output grouping in ``update_from_output`` (added with the
-  grouping commit).
+* B - the edge scheduler's request ``client_index`` routing and the
+  per-client output grouping in ``update_from_output``.
 
 Everything is CPU-only: scene validation runs against real typed
 topologies (no sockets), the scheduler seams are exercised via AST
@@ -90,6 +89,18 @@ def _topology(shape: tuple[str, int, int]) -> LwdTopology:
         }
         for cloud_id in range(clouds)
     ]
+    if scene in ("cloud_share", "lwd_cluster"):
+        for edge in edge_entries:
+            edge["coordination"] = {
+                "enabled": True,
+                "tenant_key_file": "/run/secrets/edge-cloud-tenant-key",
+            }
+        for cloud in cloud_entries:
+            cloud["coordination"] = {"enabled": True, "listen_host": "0.0.0.0"}
+            for dp in cloud["dp"]:
+                coord_port = 8100 + cloud["id"] * 10 + dp["dp_idx"]
+                dp["coord_port"] = coord_port
+                dp["coord_url"] = f"http://{dp['addr']}:{coord_port}"
     if scene == "edge_share":
         links = [{"edge": i, "cloud": i} for i in range(edges)]
     else:
@@ -159,7 +170,7 @@ class TestAttachSceneValidation:
             _lwd(LWD_CLUSTER, "edge", 1, api_server_rpc_port=self.RPC)
 
     def test_single_instance_scene_rejects_attach(self) -> None:
-        with pytest.raises(ValueError, match="scene=edge_share"):
+        with pytest.raises(ValueError, match="api-server-attach"):
             _lwd(SINGLE_INSTANCE, "edge", 0, api_server_attach=self.ATTACH)
 
     def test_cloud_role_rejects_attach(self) -> None:
@@ -299,7 +310,7 @@ def test_attach_module_homes_the_registration_protocol() -> None:
 
 
 # ------------------------------------------------------------------ #
-# B: the edge scheduler's frontend pin table and per-client grouping  #
+# B: request client_index ownership and per-client output grouping    #
 # ------------------------------------------------------------------ #
 
 _LWD_NOT_FINISHED = -1
@@ -406,17 +417,22 @@ class _SchedBase:
         self.requests = {}
         self.vllm_config = None
         self._lwd_route = {}
+        self._lwd_edge_share = True
+        self._lwd_instance_id = 0
         self._lwd_accounts = {_CONNECTION: _Account(_CONNECTION)}
-        self._lwd_req_id_to_client = {}
         self.lwd_model_family = LwdModelFamily()
         self._lwd_pending_refills = deque()
         self._lwd_aborted_req_ids = {_CONNECTION: []}
         self._lwd_announced_refills = set()
+        self.lwd_on_tokens = None
+        self.lwd_on_finish = None
 
     def _lwd_validate_request(self, request: NS) -> None:
         pass
 
-    def _lwd_route_request(self, request_id: str) -> tuple[str, int, int]:
+    def _lwd_route_request(
+        self, request_id: str, edge_id: int, preferred: Any = None
+    ) -> tuple[str, int, int]:
         self._lwd_route[request_id] = _CONNECTION
         return _CONNECTION
 
@@ -441,8 +457,9 @@ class _SchedBase:
                 request.finished = True
 
 
-_PIN_METHODS = (
+_ROUTING_METHODS = (
     "lwd_admit_request",
+    "_lwd_edge_id_of",
     "lwd_edge_cancel_admission",
     "lwd_edge_abort",
     "lwd_edge_deliver_tokens",
@@ -455,7 +472,7 @@ _PIN_METHODS = (
 
 
 def _make_sched() -> Any:
-    """Compile the pin/grouping methods out of the scheduler source into a
+    """Compile the routing/grouping methods out of the scheduler source into a
     class block inheriting the stub base (super() needs the class body's
     __class__ cell), with the module-level dependencies stubbed."""
     tree = ast.parse(SCHED_PATH.read_text(encoding="utf-8"))
@@ -465,9 +482,11 @@ def _make_sched() -> Any:
         if isinstance(n, ast.ClassDef) and n.name == "LwdEdgeScheduler"
     )
     fns = [
-        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in _PIN_METHODS
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name in _ROUTING_METHODS
     ]
-    assert {fn.name for fn in fns} == set(_PIN_METHODS), "pin method drifted"
+    assert {fn.name for fn in fns} == set(_ROUTING_METHODS), "routing method drifted"
     class_def = ast.ClassDef(
         name="LwdEdgeSchedulerUnderTest",
         bases=[ast.Name(id="_SchedBase", ctx=ast.Load())],
@@ -496,17 +515,16 @@ def _make_sched() -> Any:
 
 
 def _request(rid: str, client_index: int | None = None, finished: bool = False) -> NS:
-    """Request stand-in; ``client_index`` left unset mimics legacy
-    single-frontend callers (pin defaults to 0)."""
+    """Request stand-in; omitted ``client_index`` defaults to client 0."""
     request = NS(
         request_id=rid,
+        client_index=0 if client_index is None else client_index,
         lwd_prefix_nonce=0,
         status="finished" if finished else "waiting",
         finished=finished,
     )
-    if client_index is not None:
-        request.client_index = client_index
     request.is_finished = lambda: request.finished
+    request.append_output_token_ids = lambda token_ids: None
     return request
 
 
@@ -535,41 +553,42 @@ def _unembed_step(
     return sched.update_from_output(scheduler_output, model_runner_output)
 
 
-class TestPinTableLifecycle:
-    """B: req -> client_index pin write and cleanup (output grouping key)."""
+class TestClientIndexLifecycle:
+    """B: request client_index ownership and route cleanup."""
 
-    def test_admit_registers_pin(self) -> None:
+    def test_admit_uses_request_client_index(self) -> None:
         sched = _make_sched()
-        sched.lwd_admit_request(_request("r1", client_index=2))
-        assert sched._lwd_req_id_to_client["r1"] == 2
-        sched.lwd_admit_request(_request("r2"))
-        assert sched._lwd_req_id_to_client["r2"] == 0
+        request = _request("r1", client_index=2)
+        sched.lwd_admit_request(request)
+        assert sched._lwd_edge_id_of(request) == 2
+        default_request = _request("r2")
+        sched.lwd_admit_request(default_request)
+        assert sched._lwd_edge_id_of(default_request) == 0
 
-    def test_abort_pops_pin(self) -> None:
+    def test_abort_clears_route(self) -> None:
         sched = _make_sched()
         sched.lwd_admit_request(_request("r1", client_index=1))
         sched.lwd_edge_abort(["r1"])
-        assert "r1" not in sched._lwd_req_id_to_client
         assert "r1" not in sched._lwd_route
 
-    def test_abort_immediate_lifecycle_pops_pin(self) -> None:
-        # The engine path for abort_immediately: admission (pin written,
-        # cloud announced) then the native add_request aborts right away,
-        # which routes through the same lwd_edge_abort cleanup.
+    def test_abort_immediate_lifecycle_clears_route(self) -> None:
+        # The engine path for abort_immediately: admission (cloud announced)
+        # then the native add_request aborts right away, which routes through
+        # the same lwd_edge_abort cleanup.
         sched = _make_sched()
         sched.lwd_admit_request(_request("r1", client_index=1, finished=False))
         sched.lwd_edge_abort(["r1"])
-        assert "r1" not in sched._lwd_req_id_to_client
+        assert "r1" not in sched._lwd_route
 
-    def test_cancel_admission_pops_pin(self) -> None:
+    def test_cancel_admission_clears_route(self) -> None:
         # The engine's announcement-failure path: the request leaves the
         # books before any output can exist.
         sched = _make_sched()
         sched.lwd_admit_request(_request("r1", client_index=3))
         sched.lwd_edge_cancel_admission("r1")
-        assert "r1" not in sched._lwd_req_id_to_client
+        assert "r1" not in sched._lwd_route
 
-    def test_finish_pops_pin(self) -> None:
+    def test_finish_clears_route(self) -> None:
         sched = _make_sched()
         request = _request("r1", client_index=2)
         sched.requests["r1"] = request
@@ -579,7 +598,7 @@ class TestPinTableLifecycle:
             _notify(["r1"], [_FinishReason.STOP]),
             {"r1": [11]},
         )
-        assert "r1" not in sched._lwd_req_id_to_client
+        assert "r1" not in sched._lwd_route
         assert set(results) == {2}
 
 
@@ -618,8 +637,8 @@ class TestOutputGrouping:
         assert set(results[2].finished_requests) == {"b"}
 
     def test_single_frontend_path_unchanged(self) -> None:
-        # K=1 regression: unpinned requests group under 0 exactly like the
-        # pre-attach hardcoded {0: EngineCoreOutputs(...)}.
+        # K=1 regression: requests without explicit client metadata group
+        # under 0 exactly like the pre-attach hardcoded output mapping.
         sched = _make_sched()
         for rid in ("a", "b"):
             request = _request(rid)
@@ -647,26 +666,25 @@ class TestOutputGrouping:
         late = _unembed_step(sched, _notify(["r1"], [_FinishReason.STOP]), {"r1": [9]})
         assert late == {}
 
-    def test_late_row_for_inflight_request_keeps_pin(self) -> None:
+    def test_late_row_for_inflight_request_keeps_client_index(self) -> None:
         # The attach window: a request already streaming (first token
-        # delivered, not finished) keeps its pin, so a late row still
-        # reaches the originating frontend's group.
+        # delivered, not finished) retains its client identity, so a late row
+        # still reaches the originating frontend's group.
         sched = _make_sched()
         request = _request("r1", client_index=2)
         sched.requests["r1"] = request
         sched.lwd_admit_request(request)
         first = _unembed_step(sched, _notify(["r1"]), {"r1": [1]})
         assert set(first) == {2}
-        assert "r1" in sched._lwd_req_id_to_client
+        assert sched._lwd_edge_id_of(request) == 2
         late = _unembed_step(sched, _notify(["r1"]), {"r1": [2]})
         assert set(late) == {2}
         assert [out.new_token_ids for out in late[2].outputs] == [[2]]
 
-    def test_terminal_output_reaches_pinned_client(self) -> None:
-        # The grouping key is fixed at row entry, before the finished
-        # branch settles the request and pops the pin: the terminal token
-        # and finish signal of an attached frontend (client_index > 0)
-        # must not fall back to the 0 group.
+    def test_terminal_output_reaches_originating_client(self) -> None:
+        # The grouping key is read at row entry, before the finished branch
+        # settles the request: the terminal token and finish signal of an
+        # attached frontend (client_index > 0) must not fall back to group 0.
         sched = _make_sched()
         request = _request("r1", client_index=3)
         sched.requests["r1"] = request
@@ -677,7 +695,7 @@ class TestOutputGrouping:
         (out,) = results[3].outputs
         assert out.new_token_ids == [42]
         assert results[3].finished_requests == {"r1"}
-        assert "r1" not in sched._lwd_req_id_to_client
+        assert "r1" not in sched._lwd_route
 
 
 if __name__ == "__main__":
