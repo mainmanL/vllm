@@ -88,6 +88,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         )
         self._lwd_refill_gate: set[str] = set()
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
+        self._lwd_prefix_reset_req_ids: set[str] = set()
         self._lwd_diag = LwdControlDiag()
         self.pending_c2e: list[LwdC2eNotify] = []
         self._lwd_prefill_group_cursor = 0
@@ -100,6 +101,51 @@ class LwdCloudScheduler(LwdBaseScheduler):
     def has_requests(self) -> bool:
         """Keep the engine alive until an abort-only worker notice is sent."""
         return bool(self._lwd_abort_pending) or super().has_requests()
+
+    def reset_prefix_cache(
+        self,
+        reset_running_requests: bool = False,
+        reset_connector: bool = False,
+    ) -> bool:
+        """Reset cloud KV while keeping LWD requests resumable.
+
+        Existing reservations are invalidated before the native reset so their
+        pins cannot block it. First-time WAITING requests use the same H'/floor
+        negotiation as preempted requests. An active refill or an unfinished
+        reset recovery returns busy without changing native request state.
+
+        This resets cloud KV only; it does not invalidate edge embeddings.
+        """
+        if not reset_running_requests or not self._lwd_prefix_enabled:
+            return super().reset_prefix_cache(reset_running_requests, reset_connector)
+        if (
+            self._lwd_prefix_reset_req_ids
+            or self._lwd_refill_gate
+            or self._lwd_refill_pending
+        ):
+            lwd_logger.warning(
+                "[LWD][prefix] reset busy: recovery=%d refill_gate=%d "
+                "refill_pending=%d",
+                len(self._lwd_prefix_reset_req_ids),
+                len(self._lwd_refill_gate),
+                len(self._lwd_refill_pending),
+            )
+            return False
+
+        reservations = getattr(self, "lwd_prefix_reservations", None)
+        if reservations is None:
+            return super().reset_prefix_cache(reset_running_requests, reset_connector)
+        req_ids = {
+            req_id
+            for req_id, request in self.requests.items()
+            if not request.is_finished()
+            and getattr(request, "lwd_resume_cap_tokens", None) is not None
+        }
+        self._lwd_prefix_reset_req_ids.update(req_ids)
+        for req_id in req_ids:
+            reservations.release(req_id)
+        lwd_logger.info("[LWD][prefix] reset invalidated requests=%d", len(req_ids))
+        return super().reset_prefix_cache(reset_running_requests, reset_connector)
 
     def _lwd_schedule_step(self) -> SchedulerOutput:
         decode_ids = self._lwd_collect_decode_requests()
@@ -256,13 +302,25 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 if request_id in self._lwd_refill_gate:
                     continue
                 if start == 0:
+                    reset_invalidated = request_id in self._lwd_prefix_reset_req_ids
+                    needs_readmission = reset_invalidated or request.num_preemptions > 0
                     if (
-                        request.num_preemptions > 0
+                        needs_readmission
                         and reservations is not None
                         and not reservations.has(request_id)
-                        and not self._lwd_prep_prefix_readmission(request)
                     ):
-                        continue
+                        if reset_invalidated and request.num_preemptions == 0:
+                            floor = self.lwd_prefix_hits.get(
+                                request_id, getattr(request, "lwd_resume_cap_tokens", 0)
+                            )
+                            if floor > 0 and self.lwd_recv_rows.get(request_id, 0) == 0:
+                                # Wait for the ordinary suffix arrival to create
+                                # the host descriptor before requesting a refill.
+                                continue
+                        can_schedule = self._lwd_prep_prefix_readmission(request)
+                        self._lwd_prefix_reset_req_ids.discard(request_id)
+                        if not can_schedule:
+                            continue
                     start = prefix_start(request, reservations)
             if start >= request.num_prompt_tokens:
                 continue

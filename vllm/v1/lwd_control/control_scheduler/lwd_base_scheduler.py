@@ -218,4 +218,7 @@ class LwdBaseScheduler(AsyncScheduler):
         refill_pending = getattr(self, "_lwd_refill_pending", None)
         if refill_pending is not None:
             refill_pending.pop(request.request_id, None)
+        reset_req_ids = getattr(self, "_lwd_prefix_reset_req_ids", None)
+        if reset_req_ids is not None:
+            reset_req_ids.discard(request.request_id)
         return super()._free_request(request, delay_free_blocks)
