@@ -114,9 +114,7 @@ def test_edge_dispatch_meter_reports_gate_reasons_and_snapshot(caplog):
         running=8,
         max_running=8,
         resume=False,
-        cap=0,
         free_seq=0,
-        decode_debt=8192,
     )
     meter.note_pick("edge0-cloud0-dp0", 0)
 
@@ -125,12 +123,12 @@ def test_edge_dispatch_meter_reports_gate_reasons_and_snapshot(caplog):
 
     messages = [record.getMessage() for record in caplog.records]
     assert (
-        "[lwd][edge-gate] 1 gate checks: seat=1 pending=1 cap0=1 free_seq0=1; "
+        "[lwd][edge-gate] 1 gate checks: seat=1 pending=1 free_seq0=1; "
         "picks=1 empty=1"
     ) in messages
     assert (
         "[lwd][edge-gate-detail] edge0-cloud0-dp0 pending=10/10 running=8/8 "
-        "resume=False cap=0 free_seq=0 decode_debt=8192 picked=0"
+        "resume=False free_seq=0 picked=0"
     ) in messages
 
 
