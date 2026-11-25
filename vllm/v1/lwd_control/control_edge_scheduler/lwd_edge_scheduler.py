@@ -66,7 +66,12 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LwdRangeNotify,
     LwdRefillNotify,
 )
-from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_control_diag import (
+    LwdControlDiag,
+    LwdEdgeIntakeMeter,
+    LwdEdgeSendMeter,
+    LwdEdgeTtftMeter,
+)
 from vllm.v1.lwd_control.lwd_model.lwd_model_family import (
     LwdModelFamily,
     lwd_select_model_family,
@@ -132,6 +137,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_prefix_hash_block_size = 0
         self._lwd_pending_refills: deque[SchedulerOutput] = deque()
         self._lwd_announced_refills: set[tuple[LwdConnectionId, int]] = set()
+        self.lwd_ttft_meter = LwdEdgeTtftMeter()
+        """Hop stamps of the edge's share of TTFT, from the client's arrival
+        stamp to the first prompt rows leaving."""
+        self.lwd_intake_meter = LwdEdgeIntakeMeter()
+        """What the engine thread spends taking requests in before it steps."""
+        self.lwd_send_meter = LwdEdgeSendMeter()
+        """The announcement split into coordinator wake-up, metadata, wire."""
         # Injected by the engine once every cloud accepted the handshake.
         self.lwd_send_to_cloud: LwdSendToCloud | None = None
         self.lwd_refill_abort: Callable[[str], None] | None = None
@@ -645,6 +657,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self, dp_idx: LwdConnectionId
     ) -> tuple[list[str], dict[str, int], int]:
         """Pick routed candidates within decode debt and native edge slots."""
+        # Runs on every step and returns from several places; the meter's
+        # interval is rolled here so a window that dispatches nothing -- the
+        # one worth reading -- still reports.
+        self.lwd_ttft_meter.tick()
         account = self._lwd_accounts[dp_idx]
         # Decode debt on demand: native DECODE-phase requests routed to
         # this engine reserve spec-token budget once embedding completes
@@ -841,6 +857,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         self.lwd_send_to_cloud(dp_idx, LwdRangeNotify(seqno=seqno, items=items))
         account.register_batch(seqno, set(req_ids))
+        for request_id in req_ids:
+            # First rows leaving close a request's edge timeline; the cloud
+            # times the same span from the other end as `hold`.
+            self.lwd_ttft_meter.note_dispatch(request_id)
         # On successful send, assemble the EMBED batch and attach it to SO:
         # seqno is the pairing key of the data-plane tensor sent to the
         # cloud (same value as registered by the cloud-side RangeNotify);
@@ -972,6 +992,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             return SchedulerOutput.make_empty()
         account.take_seqno()
         account.register_batch(seqno, {request_id})
+        self.lwd_ttft_meter.note_dispatch(request_id)
         self._lwd_announced_refills.add((connection, seqno))
         batch.seqno = seqno
         return scheduler_output

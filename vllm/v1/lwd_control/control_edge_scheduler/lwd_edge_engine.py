@@ -102,6 +102,12 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             else None
         )
         self._lwd_cloud_params: dict[LwdConnectionId, LwdCloudParamsNotify] = {}
+        # Diagnostics state, all off the request path: the meter stamps are
+        # monotonic readings and the intake counters are reset per poll.
+        self._lwd_meta_done = 0.0
+        self._lwd_intake_taken = 0
+        self._lwd_intake_busy = 0.0
+        self._lwd_last_step_ts = 0.0
         self._lwd_probe_manager = LwdEdgeProbeManager(
             self.vllm_config,
             lambda: self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None)),
@@ -284,6 +290,11 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     # Engine interface overrides                                         #
     # ------------------------------------------------------------------ #
     def add_request(self, request: Request, _request_wave: int = 0) -> None:
+        # Closes the frontend segment: everything before this ran off the
+        # engine thread (HTTP, tokenize, the ZMQ hop, the input queue).
+        self.scheduler.lwd_ttft_meter.note_add_request(
+            request.request_id, request.arrival_time
+        )
         lwd_logger.info(
             "[edge] request received req=%s tokens=%d (admit + announce)",
             request.request_id,
@@ -310,10 +321,24 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     ) -> None:
         try:
             dp_idx = self.scheduler.lwd_admit_request(request, preferred)
+            # Splits the prompt-side admission work from the wait on the link.
+            self.scheduler.lwd_ttft_meter.note_routed(request.request_id)
             client = self._lwd_coord_clients.get(dp_idx)
+            started = time.monotonic()
             if client is not None:
                 client.send_first_req()
+            coord_done = time.monotonic()
             self._lwd_notify_request(dp_idx, request)
+            meta_done = self._lwd_meta_done
+            self.scheduler.lwd_ttft_meter.note_notify(request.request_id)
+            self.scheduler.lwd_send_meter.note_send(
+                coord_s=coord_done - started,
+                meta_s=max(0.0, meta_done - coord_done),
+                wire_s=max(0.0, time.monotonic() - meta_done),
+                # The send path retries inside `_lwd_send_to_cloud`; a retry
+                # count needs a counter there, which v0.30.0 does not keep.
+                retries=0,
+            )
             self._lwd_probe_manager.mark_admitted(
                 request.request_id, getattr(request, "lwd_prefix_nonce", 0)
             )
@@ -325,9 +350,34 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     def _lwd_enqueue_request(self, request: Request) -> None:
         super().add_request(request)
 
+    def _process_input_queue(self) -> None:
+        """Time the native poll, and count the requests it takes in.
+
+        The native loop polls to exhaustion before it steps, and this edge
+        admits and announces each request inline, so one poll can hold the
+        thread for as long as a whole burst takes to admit. Measuring the
+        poll is what separates that from a slow scheduler: both show up as
+        a large `dispatch`, and only this says which one it was.
+        """
+        self._lwd_intake_taken = 0
+        started = time.monotonic()
+        gap = started - self._lwd_last_step_ts if self._lwd_last_step_ts else 0.0
+        super()._process_input_queue()
+        held_s = time.monotonic() - started
+        self._lwd_last_step_ts = time.monotonic()
+        self.scheduler.lwd_intake_meter.note_poll(
+            self._lwd_intake_taken,
+            held_s,
+            # Handlers run inline in the poll, so the poll's own hold is the
+            # busy time; there is no separate idle slice to subtract here.
+            held_s,
+            gap,
+        )
+
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
+        self._lwd_intake_taken += 1
         control = getattr(self, "_lwd_prefix_control", None)
         if control is not None and control.handle_client_request(request_type, request):
             return
@@ -488,6 +538,9 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             )
         )
         metadata = self.scheduler.lwd_model_family.request_metadata(request)
+        # The announcement's cost splits here: packing the metadata above,
+        # the wire encode and send below.
+        self._lwd_meta_done = time.monotonic()
         self._lwd_send_to_cloud(
             dp_idx,
             LwdRequestNotify(

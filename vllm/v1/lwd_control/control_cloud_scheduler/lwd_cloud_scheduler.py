@@ -40,7 +40,12 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     LWD_NOT_FINISHED,
     LwdC2eNotify,
 )
-from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
+from vllm.v1.lwd_control.lwd_control_diag import (
+    LwdCloudAdmissionMeter,
+    LwdCloudStepMeter,
+    LwdCloudTtftMeter,
+    LwdControlDiag,
+)
 from vllm.v1.request import Request, RequestStatus
 
 if TYPE_CHECKING:
@@ -89,6 +94,11 @@ class LwdCloudScheduler(LwdBaseScheduler):
         self._lwd_refill_gate: set[str] = set()
         self._lwd_refill_pending: dict[str, _LwdRefillPending] = {}
         self._lwd_diag = LwdControlDiag()
+        self._lwd_admission_meter = LwdCloudAdmissionMeter()
+        self._lwd_step_meter = LwdCloudStepMeter()
+        self.lwd_ttft_meter = LwdCloudTtftMeter()
+        """Hop stamps of the cloud's share of TTFT. Public because the
+        first hops are seen by the engine's ingest thread, not here."""
         self.pending_c2e: list[LwdC2eNotify] = []
         self._lwd_prefill_group_cursor = 0
         self.lwd_finished_records: dict[str, tuple[int, int, int]] = {}
@@ -115,7 +125,35 @@ class LwdCloudScheduler(LwdBaseScheduler):
             self._lwd_warn_under_scheduled(out, windows)
         self._lwd_attach_request_metadata(out)
         self._lwd_attach_abort_notice(out)
+        self._lwd_meter_prefill(room, windows, out)
         return out
+
+    def _lwd_meter_prefill(
+        self,
+        room: int,
+        windows: list[_LwdPrefillWindow],
+        out: SchedulerOutput,
+    ) -> None:
+        """Feed the admission meter the room this step had and what used it,
+        and stamp every window that will actually run for the TTFT meter."""
+        admitted = 0
+        for window in windows:
+            rows = out.num_scheduled_tokens.get(window.request.request_id, 0)
+            if not rows:
+                continue
+            admitted += rows
+            self.lwd_ttft_meter.note_scheduled(window.request.request_id)
+        self._lwd_admission_meter.note_step(
+            room=room,
+            admitted=admitted,
+            num_windows=len(windows),
+            # TODO(lwd): v0.30.0 records neither why a candidate yielded no
+            # window nor the drafting reservation it withheld; both print as
+            # zero until it does, so read `room` against `admitted` only.
+            blocked=(0, 0),
+            queue_depth=len(self.waiting),
+            reserved=0,
+        )
 
     def _lwd_collect_decode_requests(self) -> list[str]:
         return [
@@ -432,6 +470,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
         engine_core_outputs = super().update_from_output(
             scheduler_output, model_runner_output
         )
+        self._lwd_meter_tokens(engine_core_outputs)
         self._lwd_cleanup_arrivals(engine_core_outputs)
         carriers = getattr(model_runner_output, "lwd_down_carriers", None)
         if carriers:
@@ -443,6 +482,36 @@ class LwdCloudScheduler(LwdBaseScheduler):
             self._lwd_append_diag_c2e(engine_core_outputs, nonce_snapshot)
         return engine_core_outputs
 
+    def _lwd_meter_tokens(
+        self, engine_core_outputs: dict[int, EngineCoreOutputs]
+    ) -> None:
+        """Feed the step meter the tokens this step committed, and close the
+        prefill half of any timeline whose first token is among them.
+
+        One pass serves both: the step meter needs who committed, and a
+        request's first commit is the moment its TTFT stops. The lookup
+        misses for every request already decoding, which is most of them.
+        """
+        committed: list[str] = []
+        num_tokens = 0
+        for outputs in engine_core_outputs.values():
+            for out in outputs.outputs:
+                if not out.new_token_ids:
+                    continue
+                committed.append(out.request_id)
+                num_tokens += len(out.new_token_ids)
+                self.lwd_ttft_meter.note_first_token(out.request_id)
+        self._lwd_step_meter.note_step(committed, num_tokens)
+        # Per step, not per commit: a cloud stepping with a standing backlog
+        # and no first token is the shape this line exists for.
+        self.lwd_ttft_meter.tick()
+
+    def _lwd_forget_request(self, request_id: str) -> None:
+        """Drop a finished request from the meters. Their per-request state
+        outlives the scheduler's own, so only this keeps it bounded."""
+        self.lwd_ttft_meter.forget(request_id)
+        self._lwd_step_meter.forget(request_id)
+
     def _lwd_cleanup_arrivals(
         self, engine_core_outputs: dict[int, EngineCoreOutputs]
     ) -> None:
@@ -452,6 +521,7 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 self._lwd_refill_gate.discard(request_id)
                 self._lwd_refill_pending.pop(request_id, None)
                 self._lwd_dropped.discard(request_id)
+                self._lwd_forget_request(request_id)
 
     def _lwd_c2e_prefix_nonces(
         self, request_ids: list[str], nonce_snapshot: dict[str, int]

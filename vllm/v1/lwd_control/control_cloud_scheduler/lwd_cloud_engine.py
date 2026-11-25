@@ -574,6 +574,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                 "RequestNotify prompt lengths were recorded"
             )
         self._lwd_ledger.track_range(connection_id, notify.seqno, request_ids)
+        # Rows announced: the TTFT meter's `flight` segment starts here, one
+        # request at a time, and only the first hint of a request counts.
+        for request_id in request_ids:
+            self.scheduler.lwd_ttft_meter.note_hint(request_id)
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             make_recv_hint,
             post_irecv_hint,
@@ -606,6 +610,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
 
     def _lwd_handle_request_notify(self, notify: LwdRequestNotify) -> None:
         request_id = notify.request_id
+        # Start of the cloud's share of TTFT: everything from here to the
+        # first token going back down is on this side of the link.
+        self.scheduler.lwd_ttft_meter.note_notify(request_id)
         self._lwd_ledger.prompt_lens[request_id] = notify.num_prompt_tokens
         if notify.prefix_nonce:
             self._lwd_ledger.request_nonces[request_id] = notify.prefix_nonce
@@ -955,6 +962,9 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
             if rows > previous:
                 self.scheduler.lwd_recv_rows[request_id] = rows
                 touched.append((request_id, previous, rows))
+                # Rows reached host memory: the TTFT meter's `flight`
+                # segment ends and `fill` runs until the last row lands.
+                self.scheduler.lwd_ttft_meter.note_arrival(request_id)
         if touched:
             lwd_logger.info("[LWD][cloud] arrival high watermarks updated: %s", touched)
 
@@ -1011,6 +1021,10 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
                     ],
                 )
                 self._lwd_send_until_queued(peer, restored)
+                # First token handed to the edge link: closes the cloud's
+                # share of TTFT for whichever of these just produced one.
+                for request_id in notify.req_ids:
+                    self.scheduler.lwd_ttft_meter.note_sent(request_id)
                 # Finished routes stay pinned until every pending C2E has
                 # flushed; later zero-accepted/retirement notices are legal.
                 for index, request_id in enumerate(notify.req_ids):
