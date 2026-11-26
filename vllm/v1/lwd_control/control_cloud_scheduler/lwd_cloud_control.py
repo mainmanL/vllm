@@ -630,6 +630,11 @@ def start_lwd_cloud_control_server(
     bridge.start()
     cloud_probe_timeout = max(coord_cfg.probe_timeout - PROBE_HEADROOM_S, 1.0)
     fingerprint = compute_processor_fingerprint(vllm_config.model_config)
+    logger.info(
+        "[LWD][mm-abi] cloud_id=%s fingerprint=%s",
+        lwd_config.instance.id,
+        mm_abi_header_value(fingerprint),
+    )
     servers = []
     for dp in cloud_dps:
         app = create_lwd_cloud_control_app(

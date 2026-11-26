@@ -23,7 +23,6 @@ from vllm.v1.lwd_control.control_edge_scheduler.lwd_edge_client import (
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_probe_runtime import (
     LwdProbeRuntime,
 )
-from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import compute_processor_fingerprint
 from vllm.v1.lwd_control.lwd_comm.lwd_prefix import PROBE_HEADROOM_S, LwdProbeResult
 
 logger = init_logger(__name__)
@@ -83,7 +82,12 @@ class _InflightProbe:
 class LwdEdgeProbeManager:
     """Run fanout probes off-thread and apply selections on the engine thread."""
 
-    def __init__(self, vllm_config: Any, wakeup: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        vllm_config: Any,
+        wakeup: Callable[[], None],
+        processor_fingerprint: bytes | None = None,
+    ) -> None:
         self._vllm_config = vllm_config
         self._wakeup = wakeup
         self._runtime: LwdProbeRuntime | None = None
@@ -92,7 +96,7 @@ class LwdEdgeProbeManager:
         self._nonce = 0
         self._clients: dict[tuple[int, int, int], LwdEdgePrefixClient] = {}
         self._hash_sizes: dict[tuple[int, int], int] = {}
-        self._processor_fingerprint: bytes | None = None
+        self._processor_fingerprint = processor_fingerprint
         self._tenant_key: bytes | None = None
         self._targets: dict[LwdConnectionId, str] = {}
         for connection in vllm_config.lwd_config.connections:
@@ -119,13 +123,6 @@ class LwdEdgeProbeManager:
             return request.client_index
         return self._vllm_config.lwd_config.instance_id
 
-    def _fingerprint(self) -> bytes:
-        if self._processor_fingerprint is None:
-            self._processor_fingerprint = compute_processor_fingerprint(
-                self._vllm_config.model_config
-            )
-        return self._processor_fingerprint
-
     def _key(self) -> bytes:
         if self._tenant_key is None:
             path = self._vllm_config.lwd_config.coordination.tenant_key_file
@@ -148,7 +145,7 @@ class LwdEdgeProbeManager:
             self._key(),
             consumer_id=coordination.consumer_id,
             connect_timeout=coordination.connect_timeout,
-            processor_fingerprint=self._fingerprint(),
+            processor_fingerprint=self._processor_fingerprint,
             probe_timeout=coordination.probe_timeout,
         )
         for stale in tuple(self._clients):

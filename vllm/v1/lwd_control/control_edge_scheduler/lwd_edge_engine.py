@@ -24,6 +24,7 @@ from collections import deque
 from typing import Any
 
 from vllm.config.lwd import LwdConnectionId
+from vllm.logger import init_logger
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
@@ -62,7 +63,13 @@ from vllm.v1.lwd_control.lwd_comm.lwd_messages import (
     lwd_encode_reasoning_parser_kwargs,
     lwd_encode_structured_outputs,
 )
+from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
+    compute_processor_fingerprint,
+    mm_abi_header_value,
+)
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 # Native batch queue depth: dispatched (embed + unembed) batches not yet
 # reaped. 2 keeps the pipeline aligned; the reference branch's 4 is
@@ -92,6 +99,24 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
     lwd_scheduler_cls = LwdEdgeScheduler
     scheduler: LwdEdgeScheduler
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        vllm_config = kwargs["vllm_config"]
+        coordination = vllm_config.lwd_config.coordination
+        # Match the cloud's pre-worker snapshot: Ascend model construction
+        # normalizes hf_config in place and must not change the MM identity.
+        self._lwd_processor_fingerprint = (
+            compute_processor_fingerprint(vllm_config.model_config)
+            if coordination is not None and coordination.enabled
+            else None
+        )
+        if self._lwd_processor_fingerprint is not None:
+            logger.info(
+                "[LWD][mm-abi] edge_id=%s fingerprint=%s",
+                vllm_config.lwd_config.instance_id,
+                mm_abi_header_value(self._lwd_processor_fingerprint),
+            )
+        super().__init__(*args, **kwargs)
+
     def _lwd_assemble(self) -> None:
         self._lwd_prefix_enabled = bool(
             self.vllm_config.cache_config.enable_prefix_caching
@@ -105,6 +130,7 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
         self._lwd_probe_manager = LwdEdgeProbeManager(
             self.vllm_config,
             lambda: self.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None)),
+            self._lwd_processor_fingerprint,
         )
         self._lwd_probe_chains: dict[str, list[bytes]] = {}
         self.scheduler.lwd_on_finish = self._lwd_finish_request
