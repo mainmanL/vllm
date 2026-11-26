@@ -39,6 +39,7 @@ from .lwd_hash_tables import load_tid2eid_tables
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.tasks import SupportedTask
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
@@ -142,6 +143,10 @@ class LwdEdgeGPUModelRunner(LwdBaseGPUModelRunner):
             config.num_experts_per_tok,
             config.n_routed_experts,
         )
+
+    def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+        """Generate through split edge embed/unembed, not native model forward."""
+        return ("generate",)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """The LWD edge runs no attention/transformer, so it needs no KV cache."""

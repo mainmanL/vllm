@@ -104,6 +104,14 @@ def test_load_model_matches_native_dummy_weights_contract(
     )
 
 
+def test_edge_runner_declares_generate_without_native_model_interface() -> None:
+    runner = object.__new__(LwdEdgeGPUModelRunner)
+    runner.model_config = SimpleNamespace(runner_type="generate")
+    runner.model = SimpleNamespace()
+
+    assert runner.get_supported_tasks() == ("generate",)
+
+
 def test_gpu_worker_uses_host_ucx_without_native_warmup() -> None:
     worker = object.__new__(LwdEdgeWorker)
     worker.vllm_config = SimpleNamespace(
