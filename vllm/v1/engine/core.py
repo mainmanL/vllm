@@ -1019,9 +1019,6 @@ class EngineShutdownState(IntEnum):
 class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
-    process_input_queue_budget: int | None = None
-    """Maximum nonblocking input messages per step; None means unlimited."""
-
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
     addresses: EngineZmqAddresses
 
@@ -1517,14 +1514,10 @@ class EngineCoreProc(EngineCore):
         if waited:
             logger.debug("EngineCore loop active.")
 
-        # Handle any more client requests, bounded where a subclass must
-        # guarantee the model step a turn under continuous input.
-        handled = 0
-        budget = self.process_input_queue_budget
-        while not self.input_queue.empty() and (budget is None or handled < budget):
+        # Handle any more client requests.
+        while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
-            handled += 1
 
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""

@@ -81,34 +81,3 @@ def test_request_notify_keeps_local_wake_for_independent_engine() -> None:
     engine._lwd_handle_request_notify(LwdRequestNotify("r", 16))
 
     assert engine.engines_running is True
-
-
-def test_cloud_input_queue_budget_leaves_model_step_a_turn() -> None:
-    engine, _request = _engine(LwdCloudEngineCore, has_coordinator=False)
-    engine.engines_running = True
-    engine.batch_queue = queue.Queue()
-    engine.process_input_queue_block = False
-    engine.is_running = Mock(return_value=False)
-    engine.scheduler.has_requests = Mock(return_value=True)
-    engine._lwd_poll_coordination = Mock()
-    engine._lwd_last_has_work_state = None
-    engine.aborts_queue = queue.Queue()
-    handled = []
-
-    def handle(request_type, payload) -> None:
-        handled.append(request_type)
-        if request_type == EngineCoreRequestType.WAKEUP:
-            engine.input_queue.put_nowait((EngineCoreRequestType.ADD, (object(), 0)))
-
-    engine._handle_client_request = handle
-    for _ in range(64):
-        engine.input_queue.put_nowait((EngineCoreRequestType.WAKEUP, None))
-
-    engine._process_input_queue()
-
-    assert len(handled) == 32
-    assert engine.input_queue.qsize() == 64
-
-    engine._process_input_queue()
-    assert len(handled) == 64
-    assert engine.input_queue.qsize() == 64
