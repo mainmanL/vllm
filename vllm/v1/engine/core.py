@@ -1019,6 +1019,8 @@ class EngineShutdownState(IntEnum):
 class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
 
+    process_engine_step_first = False
+
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
     addresses: EngineZmqAddresses
 
@@ -1465,12 +1467,15 @@ class EngineCoreProc(EngineCore):
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
         while self._handle_shutdown():
+            if self.process_engine_step_first:
+                self._process_engine_step()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
             # 2) Step the engine core and return the outputs.
-            self._process_engine_step()
+            if not self.process_engine_step_first:
+                self._process_engine_step()
             self._maybe_publish_request_counts()
 
         raise SystemExit
@@ -2249,8 +2254,13 @@ class DPEngineCoreProc(EngineCoreProc):
 
         # Loop until process is sent a SIGINT or SIGTERM
         while self._handle_shutdown():
-            # 1) Poll the input queue until there is work to do.
             was_running = self.engines_running
+            stepped = False
+            executed = False
+            if self.process_engine_step_first and self.eep_scaling_state is None:
+                executed = self._process_engine_step()
+                stepped = True
+            # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # Publish request counts before and after GPU step to ensure freshness.
             self._maybe_publish_request_counts()
@@ -2267,7 +2277,8 @@ class DPEngineCoreProc(EngineCoreProc):
                 elif not state.commit_requested and state.is_ready_for_switch():
                     self.process_input_queue_block = True
 
-            executed = self._process_engine_step()
+            if not stepped:
+                executed = self._process_engine_step()
             self._maybe_publish_request_counts()
 
             local_unfinished_reqs = self.scheduler.has_unfinished_requests()

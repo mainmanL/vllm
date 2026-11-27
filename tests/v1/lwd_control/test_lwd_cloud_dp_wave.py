@@ -8,6 +8,8 @@ import queue
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.engine import EngineCoreRequestType
 from vllm.v1.lwd_control.control_cloud_scheduler.lwd_cloud_engine import (
@@ -81,3 +83,24 @@ def test_request_notify_keeps_local_wake_for_independent_engine() -> None:
     engine._lwd_handle_request_notify(LwdRequestNotify("r", 16))
 
     assert engine.engines_running is True
+
+
+@pytest.mark.parametrize("engine_cls", [LwdCloudEngineCore, LwdCloudDPEngineCore])
+def test_cloud_model_step_precedes_control_drain(engine_cls) -> None:
+    engine, _request = _engine(engine_cls, has_coordinator=False)
+    events = []
+    engine._handle_shutdown = Mock(side_effect=[True, False])
+    engine._process_engine_step = Mock(
+        side_effect=lambda: events.append("model") or False
+    )
+    engine._process_input_queue = Mock(
+        side_effect=lambda: events.append("input") or None
+    )
+    engine._maybe_publish_request_counts = Mock()
+    engine.eep_scaling_state = None
+    engine.scheduler.has_unfinished_requests = Mock(return_value=False)
+
+    with pytest.raises(SystemExit):
+        engine.run_busy_loop()
+
+    assert events == ["model", "input"]

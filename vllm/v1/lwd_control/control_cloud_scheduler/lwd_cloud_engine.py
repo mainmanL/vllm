@@ -108,6 +108,7 @@ def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None
 class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     """The LWD seams of a cloud engine, shared by both engine bases."""
 
+    process_engine_step_first = True
     lwd_scheduler_cls = LwdCloudScheduler
     scheduler: LwdCloudScheduler
 
