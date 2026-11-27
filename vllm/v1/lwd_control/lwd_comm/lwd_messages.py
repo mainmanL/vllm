@@ -96,13 +96,6 @@ class LwdRequestNotify(msgspec.Struct, gc=False, tag=True):  # type: ignore[call
     gateway path must consume the same snapshot at this boundary (or discard a
     stale reservation for a fail-open zero hit), never renegotiate the hit.
     """
-    prefix_probe_succeeded: bool = False
-    """Whether a gateway probe completed and created the matching reservation.
-
-    False also covers placement-only and fail-open. Keeping this separate from
-    a zero hit preserves the HMAC manifest/finish chain of successful cache
-    misses while allowing fail-open requests to discard stale reservations.
-    """
     structured_outputs: str = ""
     """`lwd_encode_structured_outputs` wire JSON of the validated
     `StructuredOutputsParams`; empty for a plain request. The cloud rebuilds
