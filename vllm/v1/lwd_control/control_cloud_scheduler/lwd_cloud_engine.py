@@ -73,6 +73,7 @@ from vllm.v1.request import Request
 _LWD_SEND_RETRY_SLEEP_S = 0.05
 # Debug-level cloud concurrency snapshot interval.
 _LWD_CLOUD_CONC_LOG_INTERVAL_S = 10.0
+_LWD_CLOUD_INPUT_QUEUE_BUDGET = 32
 
 
 def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None:
@@ -108,6 +109,7 @@ def _lwd_log_sent_to_edge(peer: LwdPeer, message: LwdCloudToEdgeMessage) -> None
 class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
     """The LWD seams of a cloud engine, shared by both engine bases."""
 
+    process_input_queue_budget = _LWD_CLOUD_INPUT_QUEUE_BUDGET
     lwd_scheduler_cls = LwdCloudScheduler
     scheduler: LwdCloudScheduler
 
