@@ -24,7 +24,6 @@ from collections import deque
 from typing import Any
 
 from vllm.config.lwd import LwdConnectionId
-from vllm.logger import init_logger
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.engine import EngineCoreOutputs, EngineCoreRequestType
 from vllm.v1.lwd_control.control_edge_scheduler.lwd_coord_client import (
@@ -69,8 +68,6 @@ from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
 )
 from vllm.v1.request import Request
 
-logger = init_logger(__name__)
-
 # Native batch queue depth: dispatched (embed + unembed) batches not yet
 # reaped. 2 keeps the pipeline aligned; the reference branch's 4 is
 # conservative, validate performance with 2 first.
@@ -110,8 +107,8 @@ class LwdEdgeEngineCore(LwdBaseEngineCore):
             else None
         )
         if self._lwd_processor_fingerprint is not None:
-            logger.info(
-                "[LWD][mm-abi] edge_id=%s fingerprint=%s",
+            lwd_logger.info(
+                "[mm-abi] edge_id=%s fingerprint=%s",
                 vllm_config.lwd_config.instance_id,
                 mm_abi_header_value(self._lwd_processor_fingerprint),
             )

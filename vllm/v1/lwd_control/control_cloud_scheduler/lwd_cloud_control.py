@@ -28,6 +28,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm.logger import init_logger
+from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import wrap_req_id
 from vllm.v1.lwd_control.lwd_comm.lwd_mm_identity import (
     compute_processor_fingerprint,
@@ -630,8 +631,8 @@ def start_lwd_cloud_control_server(
     bridge.start()
     cloud_probe_timeout = max(coord_cfg.probe_timeout - PROBE_HEADROOM_S, 1.0)
     fingerprint = compute_processor_fingerprint(vllm_config.model_config)
-    logger.info(
-        "[LWD][mm-abi] cloud_id=%s fingerprint=%s",
+    lwd_logger.info(
+        "[mm-abi] cloud_id=%s fingerprint=%s",
         lwd_config.instance.id,
         mm_abi_header_value(fingerprint),
     )
