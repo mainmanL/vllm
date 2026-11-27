@@ -58,6 +58,14 @@ class IncrementalDetokenizer:
             # No tokenizer => skipping detokenization.
             return IncrementalDetokenizer()
 
+        # Optional tokenizer-owned output view. The default tokenizer path is
+        # unchanged; adapters retain per-request native stop/detokenizer state.
+        init_detokenizer = getattr(tokenizer, "init_incremental_detokenizer", None)
+        if callable(init_detokenizer):
+            detokenizer = init_detokenizer(request)
+            if detokenizer is not None:
+                return detokenizer
+
         if uses_fast_detokenizer(tokenizer):
             # Fast tokenizer => use tokenizers library DecodeStream.
             return FastIncrementalDetokenizer(tokenizer, request)

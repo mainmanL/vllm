@@ -134,6 +134,18 @@ class StructuredOutputManager:
         if request.structured_output_request is None:
             return
 
+        from vllm.utils.tokenizer_obfuscation import (
+            confirm_structured_output_backend_route,
+            prepare_structured_output_backend_route,
+        )
+
+        routed_backend = prepare_structured_output_backend_route(
+            request.sampling_params,
+            self.vllm_config.structured_outputs_config,
+            getattr(self, "tokenizer", None),
+            self.backend,
+        )
+
         sampling_params = request.sampling_params
         assert sampling_params is not None
         structured_outputs = sampling_params.structured_outputs
@@ -191,6 +203,8 @@ class StructuredOutputManager:
                     f"Unsupported structured output backend: {request_backend}"
                 )
             self.backend_name = request_backend
+
+        confirm_structured_output_backend_route(routed_backend, self.backend)
 
         grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar
         if self._use_async_grammar_compilation:

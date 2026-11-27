@@ -90,7 +90,7 @@ def _real_fields_from_source() -> dict[str, bool]:
 
 
 def test_request_notify_round_trips_full_prompt_mrope_positions() -> None:
-    assert LWD_MESSAGE_VERSION == 5
+    assert LWD_MESSAGE_VERSION == 6
     payload = bytes(range(24))
     decoded = lwd_decode_edge_to_cloud(
         lwd_encode_message(
@@ -123,6 +123,33 @@ def test_request_notify_round_trips_structured_outputs() -> None:
     )
     assert isinstance(decoded, LwdRequestNotify)
     assert decoded.structured_outputs == wire
+
+
+def test_request_notify_round_trips_extra_args_route_keys() -> None:
+    route = {
+        "scheme31_backend": "xgrammar",
+        "scheme31_profile_id": "p",
+        "scheme31_artifact_digest": "d",
+        "scheme31_permutation_commitment": "c",
+    }
+    decoded = lwd_decode_edge_to_cloud(
+        lwd_encode_message(
+            LwdRequestNotify(
+                request_id="r1",
+                num_prompt_tokens=1,
+                extra_args=route,
+            )
+        )
+    )
+    assert isinstance(decoded, LwdRequestNotify)
+    assert decoded.extra_args == route
+    plain = lwd_decode_edge_to_cloud(
+        lwd_encode_message(
+            LwdRequestNotify(request_id="r2", num_prompt_tokens=1)
+        )
+    )
+    assert isinstance(plain, LwdRequestNotify)
+    assert plain.extra_args is None
 
 
 def test_request_notify_round_trips_reasoning_metadata() -> None:
