@@ -716,7 +716,6 @@ class LwdCloudEngineCoreMixin(LwdBaseEngineCore):
         request.lwd_mrope_positions = req_notify.mrope_positions
         request.lwd_image_placeholder_spans = list(req_notify.image_placeholder_spans)
         request.lwd_prefix_nonce = req_notify.prefix_nonce
-        request.lwd_prefix_probe_succeeded = req_notify.prefix_probe_succeeded
         request.lwd_wire_hashes_adopted = (
             local_hasher is not None and len(req_notify.block_hashes) == expected
         )

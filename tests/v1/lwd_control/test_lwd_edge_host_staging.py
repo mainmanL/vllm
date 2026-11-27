@@ -151,17 +151,16 @@ def test_range_leaves_mrope_bytes_empty_and_full_prompt_is_read_only() -> None:
     assert scheduler.lwd_mrope_positions("r1") == b"full-prompt"
 
 
-def test_prefill_cap_reserves_spec_tokens_only_for_decode_requests() -> None:
+def test_prefill_uses_full_token_budget_with_decode_requests() -> None:
     scheduler = _scheduler()
     scheduler.max_num_scheduled_tokens = 128
     scheduler.max_num_running_reqs = 16
-    scheduler._lwd_accounts[DP0].num_speculative_tokens = 4
     scheduler._lwd_chunk_unit = 128
     scheduler._lwd_route = {"r1": DP0, "r2": DP0}
     scheduler.running = [
         SimpleNamespace(
             request_id="r1",
-            num_prompt_tokens=8,
+            num_prompt_tokens=128,
             num_computed_tokens=0,
             is_finished=lambda: False,
         ),
@@ -178,11 +177,10 @@ def test_prefill_cap_reserves_spec_tokens_only_for_decode_requests() -> None:
         model_config=SimpleNamespace(hf_text_config=SimpleNamespace(model_type="test"))
     )
 
-    _, _, cap = scheduler._lwd_pick_prefill_batch(DP0)
+    req_ids, expected = scheduler._lwd_pick_prefill_batch(DP0)
 
-    # Only the DECODE-phase request reserves spec tokens; the in-flight
-    # PREFILL request does not.
-    assert cap == 128 - 4
+    assert req_ids == ["r1"]
+    assert expected == {"r1": 128}
 
 
 def test_engine_sends_abort_to_original_dp(monkeypatch) -> None:

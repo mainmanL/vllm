@@ -31,7 +31,6 @@ class LwdCloudDpAccount:
             connection_id = LwdConnectionId(0, 0, connection_id)
         self.connection_id = connection_id
         self.max_pending_chunks = max_pending_chunks
-        self.num_speculative_tokens = 0
         self.prefix_use_eagle = False
         self.prefix_alignment_tokens = 0
         self.prefix_alignment_required = False

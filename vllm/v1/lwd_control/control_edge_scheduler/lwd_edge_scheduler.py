@@ -204,7 +204,6 @@ class LwdEdgeScheduler(LwdBaseScheduler):
     ) -> None:
         """Apply one cloud's HELLO parameters without mutating global config."""
         account = self._lwd_accounts[connection_id]
-        account.num_speculative_tokens = max(0, params.num_speculative_tokens)
         account.prefix_use_eagle = params.prefix_use_eagle
         account.prefix_alignment_tokens = max(0, params.prefix_alignment_tokens)
         account.prefix_alignment_required = params.prefix_alignment_required
@@ -643,18 +642,9 @@ class LwdEdgeScheduler(LwdBaseScheduler):
 
     def _lwd_pick_prefill_batch(
         self, dp_idx: LwdConnectionId
-    ) -> tuple[list[str], dict[str, int], int]:
-        """Pick routed candidates within decode debt and native edge slots."""
+    ) -> tuple[list[str], dict[str, int]]:
+        """Pick routed candidates within the native token and seat budgets."""
         account = self._lwd_accounts[dp_idx]
-        # Decode debt on demand: native DECODE-phase requests routed to
-        # this engine reserve spec-token budget once embedding completes
-        # (a superset of the retired first-cloud-token count -- the request
-        # needs the DOWN capacity from that moment on).
-        decode_debt = account.num_speculative_tokens * sum(
-            self._lwd_dp_of(r.request_id) == dp_idx
-            for r in self._lwd_reqs_in_phase(LwdReqPhase.DECODE, self.running)
-        )
-        cap = max(0, self.max_num_scheduled_tokens - decode_debt)
         # Native edge slots are shared across DP routes. Waiting requests
         # must not reserve slots before admission.
         free_seq = self.max_num_running_reqs - len(self.running)
@@ -683,7 +673,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         req_ids, expected = lwd_pick_prefill_batch(
             running,
             waiting,
-            cap=cap,
+            cap=self.max_num_scheduled_tokens,
             free_seq=free_seq,
             chunk_unit=(
                 account.prefix_alignment_tokens
@@ -692,18 +682,16 @@ class LwdEdgeScheduler(LwdBaseScheduler):
                 else self._lwd_chunk_unit
             ),
         )
-        return req_ids, expected, cap
+        return req_ids, expected
 
     def _lwd_schedule_batch(self, dp_idx: LwdConnectionId) -> SchedulerOutput:
         """Chunk batch assembly: the picker selects the batch of one engine,
-        scheduled via the base-class visible-set mechanism (budget clamped
-        to that engine's cap; the chunk split is guaranteed by the clamping
-        parameters to be reproduced natively).
+        scheduled via the base-class visible-set mechanism and native budget.
 
         Only this connection's hidden requests are charged against the seat
         budget, for the reason `_lwd_running_on` gives: the siblings' seats
         belong to other cloud DPs."""
-        req_ids, _expected, cap = self._lwd_pick_prefill_batch(dp_idx)
+        req_ids, _expected = self._lwd_pick_prefill_batch(dp_idx)
         picked = set(req_ids)
         hidden_seats = sum(
             1
@@ -711,9 +699,7 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             if request.request_id not in picked
             and self._lwd_route.get(request.request_id) == dp_idx
         )
-        return self._lwd_schedule(
-            req_ids, token_budget_cap=cap, hidden_seats=hidden_seats
-        )
+        return self._lwd_schedule(req_ids, hidden_seats=hidden_seats)
 
     def _try_schedule_encoder_inputs(
         self,
